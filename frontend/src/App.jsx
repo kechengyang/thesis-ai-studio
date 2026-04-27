@@ -12,6 +12,7 @@ import {
   Image,
   KeyRound,
   Loader2,
+  MessageSquareText,
   Plus,
   RefreshCw,
   Save,
@@ -58,6 +59,7 @@ export default function App() {
   const [selectedText, setSelectedText] = useState('');
   const [instruction, setInstruction] = useState('Revise the selected passage into clear, polished academic English while preserving the meaning.');
   const [suggestion, setSuggestion] = useState(null);
+  const [suggestionId, setSuggestionId] = useState('');
   const [settings, setSettings] = useState({ model: 'gpt-5.5', reasoning: 'medium' });
   const [apiKey, setApiKey] = useState('');
   const [message, setMessage] = useState('');
@@ -78,6 +80,11 @@ export default function App() {
   useEffect(() => {
     refresh().catch((error) => setMessage(error.message));
   }, []);
+
+  async function refreshMemory() {
+    const memory = await request('/memory');
+    setProject((current) => (current ? { ...current, memory } : current));
+  }
 
   function captureSelection() {
     const editor = editorRef.current;
@@ -162,6 +169,7 @@ export default function App() {
     })();
     setBusy('ai');
     setSuggestion(null);
+    setSuggestionId('');
     try {
       const response = await fetch(`${API}/ai/suggest/stream`, {
         method: 'POST',
@@ -192,6 +200,7 @@ export default function App() {
           }
           if (payload.type === 'final') {
             setSuggestion(payload.suggestion);
+            setSuggestionId(payload.suggestion_id || '');
           }
           if (payload.type === 'error') {
             throw new Error(payload.message);
@@ -199,6 +208,7 @@ export default function App() {
         }
       }
       setSelectedText(currentSelection);
+      await refreshMemory();
       setMessage('AI 建议已生成，确认后才会写入正文。');
     } catch (error) {
       setMessage(error.message);
@@ -217,12 +227,39 @@ export default function App() {
         body: JSON.stringify({
           original_segment: selectedText,
           replacement: suggestion.rewritten_text,
+          suggestion_id: suggestionId || undefined,
         }),
       });
       setContent(data.content);
       setSuggestion(null);
+      setSuggestionId('');
       setSelectedText('');
+      await refreshMemory();
       setMessage('修改已应用到正文。');
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function rejectSuggestion() {
+    if (!suggestion) return;
+    setBusy('reject');
+    try {
+      await request('/ai/reject', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          original_segment: selectedText,
+          suggestion,
+          suggestion_id: suggestionId || undefined,
+        }),
+      });
+      setSuggestion(null);
+      setSuggestionId('');
+      await refreshMemory();
+      setMessage('已拒绝建议，并记录到项目 memory。');
     } catch (error) {
       setMessage(error.message);
     } finally {
@@ -266,6 +303,7 @@ export default function App() {
   const sources = project?.sources || [];
   const files = project?.files || [];
   const projects = project?.projects || [];
+  const memory = project?.memory || { conversation_count: 0, change_count: 0, recent_conversations: [], recent_changes: [] };
   const isBusy = Boolean(busy);
 
   return (
@@ -411,6 +449,34 @@ export default function App() {
             <span>{sources.length} files</span>
           </section>
 
+          <section className="memory-panel">
+            <div className="panel-heading compact">
+              <MessageSquareText size={16} />
+              <span>项目 Memory</span>
+            </div>
+            <div className="memory-counts">
+              <span>{memory.conversation_count || 0} AI conversations</span>
+              <span>{memory.change_count || 0} edits</span>
+            </div>
+            <div className="memory-list">
+              {(memory.recent_changes || []).slice(-3).reverse().map((item) => (
+                <div className={`memory-item ${item.status}`} key={item.id}>
+                  <strong>{item.status === 'accepted' ? 'Accepted edit' : 'Rejected suggestion'}</strong>
+                  <p>{item.original_segment}</p>
+                </div>
+              ))}
+              {(memory.recent_conversations || []).slice(-2).reverse().map((item) => (
+                <div className="memory-item" key={item.id}>
+                  <strong>AI suggestion</strong>
+                  <p>{item.instruction}</p>
+                </div>
+              ))}
+              {(!memory.recent_changes?.length && !memory.recent_conversations?.length) && (
+                <p className="empty-line">No memory yet</p>
+              )}
+            </div>
+          </section>
+
           {suggestion && (
             <section className="suggestion">
               <h2>建议改写</h2>
@@ -437,7 +503,7 @@ export default function App() {
                 <button onClick={applySuggestion} disabled={isBusy} title="接受建议">
                   <Check size={18} />接受
                 </button>
-                <button onClick={() => setSuggestion(null)} title="拒绝建议">
+                <button onClick={rejectSuggestion} disabled={isBusy} title="拒绝建议">
                   <X size={18} />拒绝
                 </button>
               </div>

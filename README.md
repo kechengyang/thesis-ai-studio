@@ -77,6 +77,18 @@
 
 Quarto 是本地排版和导出工具。这个应用可以在没有 Quarto 的情况下编辑论文、管理资料、使用 AI；但导出 Word/PDF 需要安装 Quarto，并且系统命令行能找到 `quarto`。
 
+## 项目 Memory
+
+每个论文项目都有自己的 `memory/` 文件夹：
+
+```text
+memory/conversations.jsonl   AI 请求、回复和相关资料来源
+memory/changes.jsonl         接受或拒绝的修改记录
+memory/summary.md            给人和 AI 看的项目记忆摘要
+```
+
+当你生成 AI 建议时，系统会把该项目最近的 memory 一起作为上下文发给 OpenAI API，方便 AI 记住之前讨论过什么、哪些修改被接受或拒绝。
+
 ## Word 模板
 
 如果你有期刊或学校的 Word 模板，把它放到：

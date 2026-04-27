@@ -370,6 +370,62 @@ h1 {
   color: #64756f;
 }
 
+.memory-panel {
+  background: #f8f8f3;
+  border: 1px solid #e1e7df;
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.memory-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-bottom: 8px;
+}
+
+.memory-counts span {
+  background: #edf2ea;
+  border-radius: 999px;
+  color: #526258;
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+.memory-list {
+  display: grid;
+  gap: 7px;
+}
+
+.memory-item {
+  background: #ffffff;
+  border: 1px solid #e2e7df;
+  border-left: 3px solid #8ea69a;
+  border-radius: 7px;
+  padding: 8px;
+}
+
+.memory-item.accepted {
+  border-left-color: #4f8a65;
+}
+
+.memory-item.rejected {
+  border-left-color: #b77959;
+}
+
+.memory-item strong {
+  display: block;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.memory-item p {
+  color: #536058;
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 0;
+}
+
 .suggestion {
   border-top: 1px solid #e5e9e4;
   padding-top: 12px;
