@@ -15,11 +15,18 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from .analysis_skills import (
+    chat_brief_turn,
+    chat_data_turn,
+    chat_mindmap_turn,
+    dataframe_profile,
     insert_figure_into_manuscript,
     insert_mermaid_into_manuscript,
+    load_tabular_data,
     run_brief_skill,
     run_data_analysis_skill,
     run_mindmap_skill,
+    safe_project_file,
+    SUPPORTED_DATA_SUFFIXES,
 )
 from .config import (
     DEFAULT_AI_INSTRUCTION,
@@ -47,6 +54,7 @@ from .providers import get_provider, provider_payload
 from .schemas import (
     ApplyRequest,
     BriefRequest,
+    ChatRequest,
     DataAnalysisRequest,
     DataFigureInsertRequest,
     DocumentCreate,
@@ -914,6 +922,128 @@ def build_ai_trace(settings: dict[str, Any], source_hits: list[dict[str, str]], 
     }
 
 
+def _chat_embedded_context(tool: str, req: ChatRequest, project: Path) -> str:
+    """Build the JSON context string embedded in the new user message."""
+    document = paper_path().read_text(encoding="utf-8")
+    outline = outline_from_document(document)
+
+    if tool == "mindmap":
+        return json.dumps(
+            {"outline": outline, "document_excerpt": document[:4000]},
+            ensure_ascii=False,
+        )
+
+    if tool == "brief":
+        from .analysis_skills import extract_section_text
+        format_val = req.context.get("format", "ppt")
+        scope = req.context.get("scope_heading", "")
+        scoped = extract_section_text(document, scope).strip() or document
+        return json.dumps(
+            {"target_format": format_val, "scope_heading": scope, "outline": outline, "source_excerpt": scoped[:6000]},
+            ensure_ascii=False,
+        )
+
+    if tool == "data":
+        relative_path = req.context.get("relative_path", "")
+        if not relative_path:
+            raise HTTPException(status_code=400, detail="data tool 需要提供 relative_path。")
+        data_path = safe_project_file(project, relative_path, SUPPORTED_DATA_SUFFIXES)
+        df = load_tabular_data(data_path)
+        profile = dataframe_profile(df)
+        previous_code = ""
+        for msg in reversed(req.history):
+            if msg.role == "assistant" and msg.result and msg.result.get("generated_code"):
+                previous_code = msg.result["generated_code"]
+                break
+        ctx: dict[str, Any] = {
+            "data_file": data_path.name,
+            "manuscript_outline": outline,
+            "dataset_profile": profile,
+        }
+        if previous_code:
+            ctx["previous_code"] = previous_code
+        return json.dumps(ctx, ensure_ascii=False)
+
+    if tool == "literature":
+        candidate = resolve_literature_candidate(req.message)
+        candidate.setdefault("excerpt", "")
+        return json.dumps(
+            {"candidate": candidate, "outline": outline},
+            ensure_ascii=False,
+        )
+
+    return ""
+
+
+def run_chat_turn(
+    tool: str,
+    project: Path,
+    provider: Any,
+    settings: dict[str, Any],
+    req: ChatRequest,
+) -> dict[str, Any]:
+    """Dispatch one chat turn to the appropriate skill and return the assistant message dict."""
+    document = paper_path().read_text(encoding="utf-8")
+    outline = outline_from_document(document)
+    history_dicts = [msg.model_dump() for msg in req.history]
+    embedded_context = _chat_embedded_context(tool, req, project)
+    messages = build_chat_messages(history_dicts, req.message, embedded_context)
+
+    if tool == "mindmap":
+        result_data = chat_mindmap_turn(project, provider, settings, messages, outline, document)
+        result = result_data["mindmap"]
+        content = result.get("content") or result.get("summary", "已生成思维导图。")
+
+    elif tool == "brief":
+        target_format = req.context.get("format", "ppt")
+        result_data = chat_brief_turn(project, provider, settings, messages, target_format, outline)
+        result = result_data["brief"]
+        content = result.get("content") or result.get("summary", "已生成展示摘要。")
+
+    elif tool == "data":
+        relative_path = req.context.get("relative_path", "")
+        result_data = chat_data_turn(project, provider, settings, messages, relative_path, outline)
+        result = result_data["analysis"]
+        content = result.get("content") or result.get("summary", "已生成图表。")
+
+    elif tool == "literature":
+        from .providers import literature_instructions, parse_literature_json
+        candidate = resolve_literature_candidate(req.message)
+        candidate.setdefault("excerpt", "")
+        raw_text = provider.generate_chat_json(settings, literature_instructions(settings), messages)
+        analysis = parse_literature_json(raw_text)
+        analysis["title"] = analysis.get("title") or candidate.get("title", "")
+        analysis["authors"] = analysis.get("authors") or candidate.get("authors", [])
+        analysis["year"] = analysis.get("year") or candidate.get("year", "")
+        analysis["venue"] = analysis.get("venue") or candidate.get("venue", "")
+        cached_payload = {
+            "query": req.message,
+            "candidate": candidate,
+            "analysis": analysis,
+            "raw": raw_text,
+            "created_at": now_iso(),
+        }
+        cache_id = cache_literature_result(cached_payload)
+        content = analysis.get("content") or analysis.get("summary", "已完成文献分析。")
+        result = {
+            "analysis": analysis,
+            "candidate": candidate,
+            "cache_id": cache_id,
+            "download_available": bool(candidate.get("download_url")),
+        }
+
+    else:
+        raise HTTPException(status_code=400, detail=f"未知 tool：{tool}")
+
+    return {
+        "id": new_memory_id("msg"),
+        "role": "assistant",
+        "timestamp": now_iso(),
+        "content": content,
+        "result": result,
+    }
+
+
 def configured_provider(settings: Optional[dict[str, Any]] = None):
     resolved_settings = settings or read_settings()
     provider = get_provider(resolved_settings.get("provider", "openai"), load_env_file())
@@ -1307,6 +1437,51 @@ def create_brief(req: BriefRequest) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"{provider.display_name} 展示摘要生成失败：{exc}") from exc
     return {"ok": True, **result}
+
+
+@app.get("/api/chat/{tool}")
+def get_chat_history(tool: str) -> dict[str, Any]:
+    if tool not in VALID_CHAT_TOOLS:
+        raise HTTPException(status_code=400, detail=f"未知 tool：{tool}")
+    ensure_workspace()
+    project = workspace_path()
+    return {"ok": True, "tool": tool, "history": load_chat_history(tool, project)}
+
+
+@app.post("/api/chat/{tool}")
+def post_chat_turn(tool: str, req: ChatRequest) -> dict[str, Any]:
+    if tool not in VALID_CHAT_TOOLS:
+        raise HTTPException(status_code=400, detail=f"未知 tool：{tool}")
+    ensure_workspace()
+    provider, settings = configured_provider()
+    project = workspace_path()
+
+    user_msg: dict[str, Any] = {
+        "id": new_memory_id("msg"),
+        "role": "user",
+        "timestamp": now_iso(),
+        "content": req.message,
+        "context": req.context or {},
+    }
+
+    try:
+        assistant_msg = run_chat_turn(tool, project, provider, settings, req)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"AI 调用失败：{exc}") from exc
+
+    append_chat_messages(tool, project, user_msg, assistant_msg)
+    return {"ok": True, "message": assistant_msg}
+
+
+@app.delete("/api/chat/{tool}")
+def delete_chat_history(tool: str) -> dict[str, Any]:
+    if tool not in VALID_CHAT_TOOLS:
+        raise HTTPException(status_code=400, detail=f"未知 tool：{tool}")
+    ensure_workspace()
+    clear_chat_history(tool, workspace_path())
+    return {"ok": True}
 
 
 @app.post("/api/ai/suggest")
