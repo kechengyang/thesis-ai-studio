@@ -4,9 +4,12 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import matplotlib
+
+if TYPE_CHECKING:
+    from .providers import AIProvider
 
 matplotlib.use("Agg")
 
@@ -14,7 +17,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from fastapi import HTTPException
 
-from .providers import AIProvider, build_persona_block, extract_json_value, normalize_text_list
+from .providers import build_persona_block, extract_json_value, normalize_text_list
 
 
 SUPPORTED_DATA_SUFFIXES = {".csv", ".xlsx", ".xlsm"}
@@ -304,6 +307,83 @@ def run_data_analysis_skill(
     }
 
 
+def chat_data_turn(
+    project: Path,
+    provider: AIProvider,
+    settings: dict[str, Any],
+    messages: list[dict[str, str]],
+    relative_path: str,
+    outline: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Run one data analysis chat turn. `messages` already contains embedded context."""
+    data_path = safe_project_file(project, relative_path, SUPPORTED_DATA_SUFFIXES)
+    dataframe = load_tabular_data(data_path)
+    if dataframe.empty:
+        raise HTTPException(status_code=400, detail="这个数据文件是空的，无法进行分析。")
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    figure_stem = slugify(f"{data_path.stem}-chat-{timestamp}", fallback="analysis")
+    figure_relative_path = ensure_unique_relative_path(project, "figures", figure_stem, ".png")
+    figure_path = project / figure_relative_path
+
+    last_error: str | None = "未生成代码。"
+    plan: dict[str, Any] = {}
+    code = ""
+    current_messages = list(messages)
+
+    for attempt in range(MAX_CODE_RETRIES + 1):
+        raw_text = provider.generate_chat_json(
+            settings, data_analysis_code_instructions(settings), current_messages
+        )
+        plan = extract_json_value(raw_text, fallback={}) or {}
+        code = extract_chart_code(plan)
+
+        if not code:
+            last_error = "AI 没有在响应中返回 code 字段。"
+            if attempt < MAX_CODE_RETRIES:
+                current_messages = list(messages) + [
+                    {"role": "user", "content": f"上一次没有返回 code 字段，请返回包含 code 字段的完整 JSON。上次响应摘要：{raw_text[:500]}"}
+                ]
+            continue
+
+        last_error = execute_chart_code(code, dataframe, figure_path)
+        if last_error is None:
+            break
+
+        if attempt < MAX_CODE_RETRIES:
+            current_messages = list(messages) + [
+                {"role": "user", "content": f"上一段代码执行时报错，请修正。错误：{last_error}\n代码：{code[:800]}"}
+            ]
+
+    if last_error is not None or not figure_path.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"图表生成失败（已重试 {MAX_CODE_RETRIES} 次）：{last_error}",
+        )
+
+    meta = normalize_analysis_metadata(plan, "", outline, figure_relative_path)
+    record_relative_path = ensure_unique_relative_path(project, "outputs/analysis", figure_stem, ".json")
+    record_payload = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "data_file": data_path.name,
+        "generated_code": code,
+        "metadata": meta,
+        "raw_model_output": raw_text,
+    }
+    record_path = project / record_relative_path
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps(record_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    return {
+        "analysis": {
+            **meta,
+            "data_file": data_path.name,
+            "record_relative_path": record_relative_path,
+            "generated_code": code,
+        }
+    }
+
+
 def escape_attr(value: str) -> str:
     return str(value).replace('"', "&quot;")
 
@@ -424,6 +504,27 @@ def run_mindmap_skill(
     return {"mindmap": {**result, "output_relative_path": relative_path}}
 
 
+def chat_mindmap_turn(
+    project: Path,
+    provider: AIProvider,
+    settings: dict[str, Any],
+    messages: list[dict[str, str]],
+    outline: list[dict[str, Any]],
+    document: str,
+) -> dict[str, Any]:
+    """Run one mindmap chat turn. `messages` is already built by build_chat_messages."""
+    raw_text = provider.generate_chat_json(settings, mindmap_instructions(settings), messages)
+    result = normalize_mindmap(extract_json_value(raw_text, fallback={}) or {}, "")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    relative_path = ensure_unique_relative_path(
+        project, "outputs/mindmaps", f"{result['title']}-{timestamp}", ".mmd"
+    )
+    path = project / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(result["mermaid"].rstrip() + "\n", encoding="utf-8")
+    return {"mindmap": {**result, "output_relative_path": relative_path}}
+
+
 def extract_section_text(content: str, heading: str) -> str:
     if not heading.strip():
         return content
@@ -500,6 +601,27 @@ def brief_instructions(settings: dict[str, Any]) -> str:
             "`poster_sections` should be an array of objects with heading and content."
         )
     )
+
+
+def chat_brief_turn(
+    project: Path,
+    provider: AIProvider,
+    settings: dict[str, Any],
+    messages: list[dict[str, str]],
+    target_format: str,
+    outline: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Run one brief chat turn. `messages` is already built by build_chat_messages."""
+    raw_text = provider.generate_chat_json(settings, brief_instructions(settings), messages)
+    brief = normalize_brief(extract_json_value(raw_text, fallback={}) or {}, "", target_format)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    relative_path = ensure_unique_relative_path(
+        project, "outputs/briefs", f"{brief['title']}-{timestamp}", ".md"
+    )
+    path = project / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(brief_markdown(brief), encoding="utf-8")
+    return {"brief": {**brief, "output_relative_path": relative_path}}
 
 
 def brief_markdown(brief: dict[str, Any]) -> str:
