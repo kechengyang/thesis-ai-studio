@@ -17,11 +17,13 @@ from pydantic import BaseModel
 
 
 TOOL_ROOT = Path(__file__).resolve().parents[2]
-WORKSPACE = TOOL_ROOT / "workspace"
-PAPER_PATH = WORKSPACE / "paper.qmd"
 SETTINGS_PATH = TOOL_ROOT / "settings.json"
 ENV_PATH = TOOL_ROOT / ".env"
-SOURCE_INDEX_PATH = WORKSPACE / "sources" / "sources_index.json"
+STATE_PATH = TOOL_ROOT / ".runtime" / "state.json"
+PROJECTS_ROOT = Path(os.environ.get("THESIS_PROJECTS_ROOT", "/Users/anqizhang/work/thesis")).expanduser()
+LEGACY_WORKSPACE = TOOL_ROOT / "workspace"
+DEFAULT_PROJECT_ID = "thesis-draft"
+PROJECT_FOLDERS = ["data", "sources", "figures", "templates", "outputs"]
 
 DEFAULT_SETTINGS = {
     "model": "gpt-5.5",
@@ -31,35 +33,35 @@ DEFAULT_SETTINGS = {
 }
 
 DEFAULT_PAPER = """---
-title: "我的论文题目"
-author: "作者姓名"
+title: "Working Paper Title"
+author: "Author Name"
 format:
   docx:
     toc: true
 bibliography: references.bib
 ---
 
-# 摘要
+# Abstract
 
-请在这里写论文摘要。你可以选中一段文字，让右侧 AI 帮你改写、扩展或检查逻辑。
+Write your abstract here. Select any paragraph and ask the AI panel to revise, expand, or check the logic.
 
-# 引言
+# Introduction
 
-这里写研究背景、问题意识和贡献。
+Introduce the research background, research question, and contribution.
 
-# 方法
+# Methods
 
-这里写研究设计、数据来源和分析方法。
+Describe the research design, data sources, and analytical strategy.
 
-# 结果
+# Results
 
-这里写主要发现。图表可以放在 `figures/` 文件夹中，再用 Quarto 语法引用。
+Present the main findings. Figures can be placed in the `figures/` folder and referenced with Quarto syntax.
 
-# 讨论
+# Discussion
 
-这里解释结果、说明局限，并连接到既有文献。
+Interpret the findings, discuss limitations, and connect the argument to the literature.
 
-# 参考文献
+# References
 """
 
 
@@ -86,6 +88,14 @@ class ApplyRequest(BaseModel):
     replacement: str
 
 
+class ProjectCreate(BaseModel):
+    name: Optional[str] = None
+
+
+class ProjectOpen(BaseModel):
+    project_id: str
+
+
 app = FastAPI(title="Quarto AI Paper Studio", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -95,23 +105,203 @@ app.add_middleware(
         "http://localhost:5183",
         "http://127.0.0.1:5183",
     ],
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-def ensure_workspace() -> None:
-    for folder in ["data", "sources", "figures", "templates", "outputs"]:
-        (WORKSPACE / folder).mkdir(parents=True, exist_ok=True)
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip().lower()).strip("-._")
+    return slug[:80] or DEFAULT_PROJECT_ID
+
+
+def ensure_settings() -> None:
     if not SETTINGS_PATH.exists():
         SETTINGS_PATH.write_text(json.dumps(DEFAULT_SETTINGS, indent=2), encoding="utf-8")
-    if not PAPER_PATH.exists():
-        PAPER_PATH.write_text(DEFAULT_PAPER, encoding="utf-8")
-    if not (WORKSPACE / "references.bib").exists():
-        (WORKSPACE / "references.bib").write_text("", encoding="utf-8")
-    if not SOURCE_INDEX_PATH.exists():
-        SOURCE_INDEX_PATH.write_text("[]", encoding="utf-8")
+
+
+def read_state() -> dict[str, Any]:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not STATE_PATH.exists():
+        return {}
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def write_state(state: dict[str, Any]) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def safe_project_path(project_id: str) -> Path:
+    project_path = (PROJECTS_ROOT / slugify(project_id)).resolve()
+    root = PROJECTS_ROOT.resolve()
+    try:
+        project_path.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="项目名称不安全，请换一个名称。") from exc
+    return project_path
+
+
+def paper_path(project_id: Optional[str] = None) -> Path:
+    return workspace_path(project_id) / "paper.qmd"
+
+
+def source_index_path(project_id: Optional[str] = None) -> Path:
+    return workspace_path(project_id) / "sources" / "sources_index.json"
+
+
+def existing_projects() -> list[dict[str, Any]]:
+    PROJECTS_ROOT.mkdir(parents=True, exist_ok=True)
+    projects = []
+    for path in sorted(PROJECTS_ROOT.iterdir()):
+        if not path.is_dir() or path.name.startswith("."):
+            continue
+        paper = path / "paper.qmd"
+        modified_source = paper if paper.exists() else path
+        projects.append(
+            {
+                "id": path.name,
+                "name": path.name.replace("-", " ").title(),
+                "path": str(path),
+                "paper_exists": paper.exists(),
+                "modified_at": datetime.fromtimestamp(modified_source.stat().st_mtime).isoformat(timespec="seconds"),
+            }
+        )
+    return projects
+
+
+def copy_legacy_materials(destination: Path) -> None:
+    if not LEGACY_WORKSPACE.exists():
+        return
+    for folder in PROJECT_FOLDERS:
+        source_dir = LEGACY_WORKSPACE / folder
+        target_dir = destination / folder
+        if not source_dir.exists() or not source_dir.is_dir():
+            continue
+        for source_file in source_dir.iterdir():
+            if not source_file.is_file() or source_file.name == ".gitkeep":
+                continue
+            target_file = target_dir / source_file.name
+            if not target_file.exists():
+                shutil.copy2(source_file, target_file)
+
+
+def repair_source_index(project: Path) -> None:
+    index_path = project / "sources" / "sources_index.json"
+    try:
+        existing = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else []
+    except json.JSONDecodeError:
+        existing = []
+    if existing:
+        return
+    entries = []
+    candidate_texts = list((project / "sources").glob("*.txt")) if (project / "sources").exists() else []
+    data_dir = project / "data"
+    if data_dir.exists():
+        for data_file in sorted(data_dir.iterdir()):
+            if not data_file.is_file() or data_file.name == ".DS_Store":
+                continue
+            if data_file.suffix.lower() not in [".csv", ".xlsx", ".xlsm"]:
+                continue
+            text_file = project / "sources" / f"data-{data_file.stem}.txt"
+            if not text_file.exists():
+                try:
+                    text_file.write_text(extract_text(data_file), encoding="utf-8")
+                except HTTPException:
+                    continue
+            candidate_texts.append(text_file)
+    if not candidate_texts:
+        return
+    for text_path in sorted(set(candidate_texts)):
+        source_dir = text_path.parent
+        originals = [
+            path
+            for path in source_dir.iterdir()
+            if path.is_file()
+            and path.stem == text_path.stem
+            and path.name != text_path.name
+            and path.suffix.lower() in [".pdf", ".docx", ".csv", ".xlsx", ".xlsm"]
+        ]
+        if text_path.name.startswith("data-"):
+            data_name = text_path.name.removeprefix("data-").removesuffix(".txt")
+            originals = [
+                path
+                for path in data_dir.iterdir()
+                if path.is_file() and path.stem == data_name and path.suffix.lower() in [".csv", ".xlsx", ".xlsm"]
+            ]
+        filename = originals[0].name if originals else text_path.name
+        text = text_path.read_text(encoding="utf-8", errors="ignore")
+        entries.append(
+            {
+                "filename": filename,
+                "text_file": text_path.name,
+                "characters": len(text),
+                "imported_at": datetime.fromtimestamp(text_path.stat().st_mtime).isoformat(timespec="seconds"),
+            }
+        )
+    if entries:
+        index_path.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def ensure_project(project_id: Optional[str] = None, title: Optional[str] = None, seed_legacy: bool = False) -> Path:
+    ensure_settings()
+    PROJECTS_ROOT.mkdir(parents=True, exist_ok=True)
+    resolved_id = slugify(project_id or DEFAULT_PROJECT_ID)
+    project = safe_project_path(resolved_id)
+    for folder in PROJECT_FOLDERS:
+        (project / folder).mkdir(parents=True, exist_ok=True)
+    if not (project / "paper.qmd").exists():
+        paper = DEFAULT_PAPER
+        if title:
+            paper = paper.replace('title: "Working Paper Title"', f'title: "{title}"')
+        (project / "paper.qmd").write_text(paper, encoding="utf-8")
+    if not (project / "references.bib").exists():
+        (project / "references.bib").write_text("", encoding="utf-8")
+    if not (project / "sources" / "sources_index.json").exists():
+        (project / "sources" / "sources_index.json").write_text("[]", encoding="utf-8")
+    if seed_legacy:
+        copy_legacy_materials(project)
+    repair_source_index(project)
+    return project
+
+
+def active_project_id() -> str:
+    state = read_state()
+    candidate = slugify(state.get("active_project", DEFAULT_PROJECT_ID))
+    if safe_project_path(candidate).exists():
+        return candidate
+    projects = existing_projects()
+    if projects:
+        selected = projects[0]["id"]
+    else:
+        selected = DEFAULT_PROJECT_ID
+        ensure_project(selected, title="Thesis Draft", seed_legacy=True)
+    write_state({"active_project": selected})
+    return selected
+
+
+def set_active_project(project_id: str) -> None:
+    project_id = slugify(project_id)
+    if not safe_project_path(project_id).exists():
+        raise HTTPException(status_code=404, detail="没有找到这个论文项目。")
+    ensure_project(project_id, title=project_id.replace("-", " ").title())
+    write_state({"active_project": project_id})
+
+
+def workspace_path(project_id: Optional[str] = None) -> Path:
+    project_id = slugify(project_id or active_project_id())
+    ensure_project(project_id)
+    return safe_project_path(project_id)
+
+
+def ensure_workspace() -> None:
+    project_id = active_project_id()
+    ensure_project(project_id)
 
 
 def load_env_file() -> dict[str, str]:
@@ -127,7 +317,7 @@ def load_env_file() -> dict[str, str]:
 
 
 def read_settings() -> dict[str, Any]:
-    ensure_workspace()
+    ensure_settings()
     try:
         loaded = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
@@ -171,16 +361,64 @@ def outline_from_document(content: str) -> list[dict[str, Any]]:
     return outline
 
 
-def read_source_index() -> list[dict[str, Any]]:
+def read_source_index(project_id: Optional[str] = None) -> list[dict[str, Any]]:
     ensure_workspace()
+    index_path = source_index_path(project_id)
     try:
-        return json.loads(SOURCE_INDEX_PATH.read_text(encoding="utf-8"))
+        return json.loads(index_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return []
 
 
-def write_source_index(items: list[dict[str, Any]]) -> None:
-    SOURCE_INDEX_PATH.write_text(json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8")
+def write_source_index(items: list[dict[str, Any]], project_id: Optional[str] = None) -> None:
+    source_index_path(project_id).write_text(json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def file_size_label(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
+def list_project_files(project: Path) -> list[dict[str, Any]]:
+    categories = [
+        ("Manuscript", [project / "paper.qmd", project / "references.bib"]),
+        (
+            "Project Root",
+            sorted(
+                path
+                for path in project.iterdir()
+                if path.is_file() and path.name not in ["paper.qmd", "references.bib"]
+            ),
+        ),
+        ("Sources", sorted((project / "sources").glob("*"))),
+        ("Data", sorted((project / "data").glob("*"))),
+        ("Figures", sorted((project / "figures").glob("*"))),
+        ("Templates", sorted((project / "templates").glob("*"))),
+        ("Outputs", sorted((project / "outputs").glob("*"))),
+    ]
+    result = []
+    for category, paths in categories:
+        files = []
+        for path in paths:
+            if not path.exists() or not path.is_file() or path.name == ".gitkeep":
+                continue
+            if path.name == "sources_index.json":
+                continue
+            files.append(
+                {
+                    "name": path.name,
+                    "relative_path": str(path.relative_to(project)),
+                    "size": path.stat().st_size,
+                    "size_label": file_size_label(path.stat().st_size),
+                    "modified_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+                    "extension": path.suffix.lower().lstrip(".") or "file",
+                }
+            )
+        result.append({"category": category, "files": files})
+    return result
 
 
 def extract_pdf(path: Path) -> str:
@@ -249,10 +487,11 @@ def chunks(text: str, size: int = 1200) -> list[str]:
 
 
 def search_sources(query: str, limit: int = 5) -> list[dict[str, str]]:
+    project = workspace_path()
     terms = [term.lower() for term in re.findall(r"[\w\-]{2,}", query)]
     scored = []
     for item in read_source_index():
-        text_path = WORKSPACE / "sources" / item.get("text_file", "")
+        text_path = project / "sources" / item.get("text_file", "")
         if not text_path.exists():
             continue
         for chunk in chunks(text_path.read_text(encoding="utf-8", errors="ignore")):
@@ -284,10 +523,11 @@ def build_ai_prompt(req: SuggestRequest, document: str) -> str:
 
 def ai_instructions() -> str:
     return (
-        "你是严谨的中文/英文学术论文写作协作助手。"
-        "只根据用户选中文本、论文大纲和提供的本地资料片段提出修改建议。"
-        "不要编造引用、数据或结论；不确定时必须提醒用户核对。"
-        "输出必须是 JSON，字段包括 rewritten_text, rationale, risks, citation_or_data_notes, confidence。"
+        "You are a rigorous academic writing collaborator. "
+        "By default, revise the selected passage in polished academic English. "
+        "Use only the selected text, paper outline, and provided local-source excerpts. "
+        "Do not invent citations, data, or findings; flag uncertainty clearly. "
+        "Return JSON only with these fields: rewritten_text, rationale, risks, citation_or_data_notes, confidence."
     )
 
 
@@ -303,7 +543,7 @@ def prepare_ai_request(req: SuggestRequest) -> tuple[Any, dict[str, Any], str]:
         raise HTTPException(status_code=500, detail="需要安装 openai Python 包。") from exc
 
     settings = read_settings()
-    document = req.document if req.document is not None else PAPER_PATH.read_text(encoding="utf-8")
+    document = req.document if req.document is not None else paper_path().read_text(encoding="utf-8")
     prompt = build_ai_prompt(req, document)
     return OpenAI(api_key=api_key), settings, prompt
 
@@ -335,34 +575,61 @@ def startup() -> None:
 @app.get("/api/project")
 def get_project() -> dict[str, Any]:
     ensure_workspace()
-    content = PAPER_PATH.read_text(encoding="utf-8")
+    project_id = active_project_id()
+    project = workspace_path(project_id)
+    content = (project / "paper.qmd").read_text(encoding="utf-8")
     settings = read_settings()
+    quarto_path = shutil.which("quarto")
     return {
-        "workspace": str(WORKSPACE),
-        "paper_exists": PAPER_PATH.exists(),
+        "projects_root": str(PROJECTS_ROOT),
+        "workspace": str(project),
+        "active_project": project_id,
+        "projects": existing_projects(),
+        "paper_exists": (project / "paper.qmd").exists(),
         "outline": outline_from_document(content),
-        "sources": read_source_index(),
+        "sources": read_source_index(project_id),
+        "files": list_project_files(project),
         "settings": {**settings, "api_key_masked": masked_api_key()},
-        "quarto_available": shutil.which("quarto") is not None,
+        "quarto_available": quarto_path is not None,
+        "quarto_path": quarto_path,
+        "quarto_message": (
+            "Quarto is installed and ready for Word export."
+            if quarto_path
+            else "Quarto was not found. Editing and AI still work; install Quarto to export Word/PDF."
+        ),
     }
 
 
 @app.post("/api/project/create")
-def create_project() -> dict[str, Any]:
-    ensure_workspace()
+def create_project(req: ProjectCreate) -> dict[str, Any]:
+    name = (req.name or "Thesis Draft").strip()
+    project_id = slugify(name)
+    suffix = 2
+    candidate = project_id
+    while (safe_project_path(candidate) / "paper.qmd").exists():
+        candidate = f"{project_id}-{suffix}"
+        suffix += 1
+    ensure_project(candidate, title=name, seed_legacy=(not existing_projects()))
+    set_active_project(candidate)
+    return get_project()
+
+
+@app.post("/api/project/open")
+def open_project(req: ProjectOpen) -> dict[str, Any]:
+    set_active_project(req.project_id)
     return get_project()
 
 
 @app.get("/api/document")
 def get_document() -> dict[str, str]:
     ensure_workspace()
-    return {"content": PAPER_PATH.read_text(encoding="utf-8")}
+    return {"content": paper_path().read_text(encoding="utf-8")}
 
 
 @app.post("/api/document")
 def update_document(update: DocumentUpdate) -> dict[str, Any]:
     ensure_workspace()
-    PAPER_PATH.write_text(update.content, encoding="utf-8")
+    paper_path().write_text(update.content, encoding="utf-8")
     return {"ok": True, "outline": outline_from_document(update.content)}
 
 
@@ -390,15 +657,16 @@ async def import_source(file: UploadFile = File(...)) -> dict[str, Any]:
     ensure_workspace()
     if not file.filename:
         raise HTTPException(status_code=400, detail="没有收到文件名。")
+    project = workspace_path()
     safe_name = Path(file.filename).name
-    target = WORKSPACE / "sources" / safe_name
+    target = project / "sources" / safe_name
     with target.open("wb") as handle:
         handle.write(await file.read())
     extracted = extract_text(target)
     if not extracted.strip():
         raise HTTPException(status_code=400, detail="文件已保存，但没有提取到可读取的文字。")
     text_file = f"{target.stem}.txt"
-    (WORKSPACE / "sources" / text_file).write_text(extracted, encoding="utf-8")
+    (project / "sources" / text_file).write_text(extracted, encoding="utf-8")
     items = [item for item in read_source_index() if item.get("filename") != safe_name]
     entry = {
         "filename": safe_name,
@@ -464,11 +732,12 @@ def apply_suggestion(req: ApplyRequest) -> dict[str, Any]:
     ensure_workspace()
     if not req.original_segment:
         raise HTTPException(status_code=400, detail="缺少原文片段，无法安全替换。")
-    content = PAPER_PATH.read_text(encoding="utf-8")
+    current_paper = paper_path()
+    content = current_paper.read_text(encoding="utf-8")
     if req.original_segment not in content:
         raise HTTPException(status_code=409, detail="原文片段已经变化，请重新选择段落后再应用。")
     updated = content.replace(req.original_segment, req.replacement, 1)
-    PAPER_PATH.write_text(updated, encoding="utf-8")
+    current_paper.write_text(updated, encoding="utf-8")
     return {"ok": True, "content": updated, "outline": outline_from_document(updated)}
 
 
@@ -478,17 +747,18 @@ def export_docx() -> dict[str, Any]:
     if shutil.which("quarto") is None:
         raise HTTPException(status_code=400, detail="没有找到 Quarto。请先安装 Quarto 后再导出 Word。")
     settings = read_settings()
-    export_dir = WORKSPACE / settings.get("export_dir", "outputs")
+    project = workspace_path()
+    export_dir = project / settings.get("export_dir", "outputs")
     export_dir.mkdir(parents=True, exist_ok=True)
     output_name = f"paper-{datetime.now().strftime('%Y%m%d-%H%M%S')}.docx"
     command = ["quarto", "render", "paper.qmd", "--to", "docx", "--output", output_name]
-    reference_doc = WORKSPACE / settings.get("reference_doc", "templates/reference.docx")
+    reference_doc = project / settings.get("reference_doc", "templates/reference.docx")
     if reference_doc.exists():
         command.extend(["-M", f"reference-doc:{reference_doc}"])
-    result = subprocess.run(command, cwd=WORKSPACE, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(command, cwd=project, capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
         raise HTTPException(status_code=500, detail=f"Word 导出失败：{result.stderr or result.stdout}")
-    generated = WORKSPACE / output_name
+    generated = project / output_name
     final_path = export_dir / output_name
     if generated.exists() and generated != final_path:
         generated.replace(final_path)

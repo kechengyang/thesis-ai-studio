@@ -11,8 +11,18 @@ NPM_CACHE_DIR="$RUNTIME_DIR/npm-cache"
 BACKEND_PORT="${BACKEND_PORT:-8011}"
 FRONTEND_PORT="${FRONTEND_PORT:-5183}"
 
+find_free_port() {
+  local port="$1"
+  while lsof -tiTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; do
+    port=$((port + 1))
+  done
+  echo "$port"
+}
+
 mkdir -p "$LOG_DIR" "$RUN_DIR" "$PIP_CACHE_DIR" "$NPM_CACHE_DIR"
 "$ROOT_DIR/stop.sh"
+BACKEND_PORT="$(find_free_port "$BACKEND_PORT")"
+FRONTEND_PORT="$(find_free_port "$FRONTEND_PORT")"
 
 if [ ! -d "$VENV_DIR" ] || [ ! -d "$ROOT_DIR/frontend/node_modules" ]; then
   "$ROOT_DIR/setup.sh"
@@ -44,5 +54,6 @@ echo "后端日志：$LOG_DIR/backend.log"
 echo "前端日志：$LOG_DIR/frontend.log"
 echo "打开：http://127.0.0.1:$FRONTEND_PORT/"
 echo "按 Ctrl+C 停止。"
+printf '{"backend_port":%s,"frontend_port":%s}\n' "$BACKEND_PORT" "$FRONTEND_PORT" > "$RUNTIME_DIR/current.json"
 
 wait

@@ -1,13 +1,22 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  BookOpen,
   Bot,
   Check,
+  CircleAlert,
+  Database,
   Download,
-  FilePlus2,
+  FileText,
+  Folder,
   FolderOpen,
+  Image,
   KeyRound,
   Loader2,
+  Plus,
+  RefreshCw,
   Save,
+  Settings,
+  Sparkles,
   Upload,
   X,
 } from 'lucide-react';
@@ -34,18 +43,28 @@ function splitSections(content) {
     }));
 }
 
+function categoryIcon(category) {
+  if (category === 'Manuscript') return <BookOpen size={15} />;
+  if (category === 'Sources') return <FileText size={15} />;
+  if (category === 'Data') return <Database size={15} />;
+  if (category === 'Figures') return <Image size={15} />;
+  return <Folder size={15} />;
+}
+
 export default function App() {
   const editorRef = useRef(null);
   const [project, setProject] = useState(null);
   const [content, setContent] = useState('');
   const [selectedText, setSelectedText] = useState('');
-  const [instruction, setInstruction] = useState('请帮我把这段改得更清晰、更符合学术论文表达。');
+  const [instruction, setInstruction] = useState('Revise the selected passage into clear, polished academic English while preserving the meaning.');
   const [suggestion, setSuggestion] = useState(null);
   const [settings, setSettings] = useState({ model: 'gpt-5.5', reasoning: 'medium' });
   const [apiKey, setApiKey] = useState('');
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState('');
   const [showSettings, setShowSettings] = useState(false);
+  const [newProjectName, setNewProjectName] = useState('Thesis Draft');
+  const [selectedProjectId, setSelectedProjectId] = useState('');
 
   async function refresh() {
     const projectData = await request('/project');
@@ -53,6 +72,7 @@ export default function App() {
     setProject(projectData);
     setSettings(projectData.settings);
     setContent(documentData.content);
+    setSelectedProjectId(projectData.active_project);
   }
 
   useEffect(() => {
@@ -62,16 +82,37 @@ export default function App() {
   function captureSelection() {
     const editor = editorRef.current;
     if (!editor) return;
-    const value = editor.value.slice(editor.selectionStart, editor.selectionEnd);
-    setSelectedText(value);
+    setSelectedText(editor.value.slice(editor.selectionStart, editor.selectionEnd));
   }
 
   async function createProject() {
     setBusy('create');
     try {
-      await request('/project/create', { method: 'POST' });
+      await request('/project/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newProjectName || 'Thesis Draft' }),
+      });
       await refresh();
-      setMessage('论文项目已准备好。');
+      setMessage('新论文项目已创建。');
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function openProject(projectId = selectedProjectId) {
+    if (!projectId) return;
+    setBusy('open');
+    try {
+      await request('/project/open', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: projectId }),
+      });
+      await refresh();
+      setMessage('项目已打开。');
     } catch (error) {
       setMessage(error.message);
     } finally {
@@ -87,7 +128,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content }),
       });
-      setMessage('已保存正文。');
+      setMessage('已保存 paper.qmd。');
     } catch (error) {
       setMessage(error.message);
     } finally {
@@ -223,21 +264,21 @@ export default function App() {
 
   const outline = splitSections(content);
   const sources = project?.sources || [];
+  const files = project?.files || [];
+  const projects = project?.projects || [];
   const isBusy = Boolean(busy);
 
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div>
-          <p className="eyebrow">Quarto AI Paper Studio</p>
-          <h1>论文工作台</h1>
+        <div className="brand-block">
+          <p className="eyebrow">Local Quarto AI Studio</p>
+          <h1>Thesis workspace</h1>
+          <p className="root-path">{project?.projects_root || '/Users/anqizhang/work/thesis'}</p>
         </div>
         <div className="toolbar">
-          <button onClick={createProject} disabled={isBusy} title="新建论文">
-            <FilePlus2 size={18} />新建论文
-          </button>
-          <button onClick={refresh} disabled={isBusy} title="打开论文">
-            <FolderOpen size={18} />打开论文
+          <button onClick={refresh} disabled={isBusy} title="刷新">
+            <RefreshCw size={18} />刷新
           </button>
           <label className="button-like" title="导入资料">
             <Upload size={18} />导入资料
@@ -247,7 +288,7 @@ export default function App() {
             <Download size={18} />导出 Word
           </button>
           <button onClick={() => setShowSettings(true)} title="设置">
-            <KeyRound size={18} />设置
+            <Settings size={18} />设置
           </button>
         </div>
       </header>
@@ -255,36 +296,83 @@ export default function App() {
       {message && <section className="notice">{message}</section>}
 
       <section className="workspace-grid">
-        <aside className="sidebar">
-          <div className="panel-title">论文结构</div>
-          <nav className="outline">
-            {outline.map((item, index) => (
-              <button key={`${item.title}-${index}`} style={{ paddingLeft: `${item.level * 10}px` }}>
-                {item.title}
+        <aside className="project-panel">
+          <section className="panel-section">
+            <div className="panel-heading">
+              <FolderOpen size={16} />
+              <span>论文项目</span>
+            </div>
+            <div className="project-open-row">
+              <select value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.target.value)}>
+                {projects.map((item) => (
+                  <option key={item.id} value={item.id}>{item.name}</option>
+                ))}
+              </select>
+              <button onClick={() => openProject()} disabled={isBusy || !selectedProjectId} title="打开项目">
+                打开
               </button>
-            ))}
-          </nav>
-          <div className="panel-title sources-title">本地资料</div>
-          <div className="source-list">
-            {sources.length === 0 && <p>还没有导入资料。</p>}
-            {sources.map((source) => (
-              <div className="source-item" key={source.filename}>
-                <strong>{source.filename}</strong>
-                <span>{source.characters} 字符</span>
-              </div>
-            ))}
-          </div>
-          <div className="status-box">
-            <span>Quarto</span>
-            <strong>{project?.quarto_available ? '已找到' : '未找到'}</strong>
-          </div>
+            </div>
+            <div className="new-project-row">
+              <input value={newProjectName} onChange={(event) => setNewProjectName(event.target.value)} />
+              <button onClick={createProject} disabled={isBusy} title="新建论文项目">
+                <Plus size={16} />
+              </button>
+            </div>
+            <p className="active-path">{project?.workspace}</p>
+          </section>
+
+          <section className="panel-section">
+            <div className="panel-heading">
+              <BookOpen size={16} />
+              <span>论文结构</span>
+            </div>
+            <nav className="outline">
+              {outline.map((item, index) => (
+                <button key={`${item.title}-${index}`} style={{ paddingLeft: `${item.level * 10}px` }}>
+                  {item.title}
+                </button>
+              ))}
+            </nav>
+          </section>
+
+          <section className="panel-section">
+            <div className="panel-heading">
+              <Folder size={16} />
+              <span>项目文件</span>
+            </div>
+            <div className="file-browser">
+              {files.map((group) => (
+                <details key={group.category} open={['Manuscript', 'Sources', 'Data'].includes(group.category)}>
+                  <summary>{categoryIcon(group.category)}{group.category}</summary>
+                  {group.files.length === 0 && <p className="empty-line">No files</p>}
+                  {group.files.map((file) => (
+                    <div className="file-row" key={file.relative_path}>
+                      <span>{file.name}</span>
+                      <small>{file.size_label}</small>
+                    </div>
+                  ))}
+                </details>
+              ))}
+            </div>
+          </section>
+
+          <section className={`quarto-box ${project?.quarto_available ? 'ready' : 'missing'}`}>
+            <div>
+              <strong>Quarto</strong>
+              <p>{project?.quarto_message}</p>
+            </div>
+            <CircleAlert size={18} />
+          </section>
         </aside>
 
         <section className="editor-panel">
           <div className="editor-head">
             <div>
-              <div className="panel-title">正文</div>
-              <p>主稿文件：paper.qmd</p>
+              <div className="panel-heading compact">
+                <FileText size={16} />
+                <span>paper.qmd</span>
+              </div>
+              <p>English Quarto manuscript</p>
             </div>
             <button onClick={saveDocument} disabled={isBusy} title="保存正文">
               <Save size={18} />保存
@@ -295,15 +383,18 @@ export default function App() {
             value={content}
             onChange={(event) => setContent(event.target.value)}
             onSelect={captureSelection}
-            spellCheck={false}
+            spellCheck={true}
           />
         </section>
 
         <aside className="ai-panel">
-          <div className="panel-title">AI 协作</div>
+          <div className="panel-heading">
+            <Sparkles size={16} />
+            <span>AI 协作</span>
+          </div>
           <div className="selection-box">
             <span>当前选中</span>
-            <p>{selectedText ? selectedText.slice(0, 220) : '请先在正文里选中一段文字。'}</p>
+            <p>{selectedText ? selectedText.slice(0, 260) : '请先在正文里选中一段文字。'}</p>
           </div>
           <textarea
             className="instruction"
@@ -314,6 +405,11 @@ export default function App() {
             {busy === 'ai' ? <Loader2 className="spin" size={18} /> : <Bot size={18} />}
             生成建议
           </button>
+
+          <section className="source-strip">
+            <strong>已索引资料</strong>
+            <span>{sources.length} files</span>
+          </section>
 
           {suggestion && (
             <section className="suggestion">
@@ -395,7 +491,7 @@ export default function App() {
               />
             </label>
             <button className="primary" onClick={saveSettings} disabled={isBusy}>
-              <Save size={18} />保存设置
+              <KeyRound size={18} />保存设置
             </button>
           </section>
         </div>

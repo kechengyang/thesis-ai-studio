@@ -1,30 +1,30 @@
 ---
-title: "我的论文题目"
-author: "作者姓名"
+title: "Working Paper Title"
+author: "Author Name"
 format:
   docx:
     toc: true
 bibliography: references.bib
 ---
 
-# 摘要
+# Abstract
 
-请在这里写论文摘要。你可以选中一段文字，让右侧 AI 帮你改写、扩展或检查逻辑。
+Write your abstract here. Select any paragraph and ask the AI panel to revise, expand, or check the logic.
 
-# 引言
+# Introduction
 
-这里写研究背景、问题意识和贡献。
+Introduce the research background, research question, and contribution.
 
-# 方法
+# Methods
 
-这里写研究设计、数据来源和分析方法。
+Describe the research design, data sources, and analytical strategy.
 
-# 结果
+# Results
 
-这里写主要发现。图表可以放在 `figures/` 文件夹中，再用 Quarto 语法引用。
+Present the main findings. Figures can be placed in the `figures/` folder and referenced with Quarto syntax.
 
-# 讨论
+# Discussion
 
-这里解释结果、说明局限，并连接到既有文献。
+Interpret the findings, discuss limitations, and connect the argument to the literature.
 
-# 参考文献
+# References
