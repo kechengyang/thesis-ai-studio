@@ -681,6 +681,7 @@ def prepare_ai_request(req: SuggestRequest) -> tuple[Any, dict[str, Any], str, P
     if not api_key:
         raise HTTPException(status_code=400, detail="请先在设置中填写 OpenAI API Key。")
     try:
+        import openai
         from openai import OpenAI
     except ImportError as exc:
         raise HTTPException(status_code=500, detail="需要安装 openai Python 包。") from exc
@@ -689,7 +690,17 @@ def prepare_ai_request(req: SuggestRequest) -> tuple[Any, dict[str, Any], str, P
     project = workspace_path()
     document = req.document if req.document is not None else paper_path().read_text(encoding="utf-8")
     prompt, source_hits = build_ai_prompt(req, document, project)
-    return OpenAI(api_key=api_key), settings, prompt, project, source_hits
+    client = OpenAI(api_key=api_key)
+    if not hasattr(client, "responses"):
+        version = getattr(openai, "__version__", "unknown")
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"OpenAI Python SDK 版本过旧（当前 {version}），不支持 Responses API。"
+                "请在 /Users/anqizhang/tool 运行 ./setup.sh 后重启。"
+            ),
+        )
+    return client, settings, prompt, project, source_hits
 
 
 def parse_ai_json(text: str) -> dict[str, Any]:
