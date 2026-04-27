@@ -303,13 +303,6 @@ h1 {
   margin: 0 0 6px;
 }
 
-.workspace-overview-copy {
-  color: #68766b;
-  font-size: 12px;
-  line-height: 1.5;
-  margin: 8px 0 0;
-}
-
 .outline {
   display: flex;
   flex-direction: column;
@@ -1822,7 +1815,7 @@ h1 {
   flex-direction: column;
   background: #ffffff;
   border: 1px solid #d5ddd4;
-  border-radius: 10px;
+  border-radius: 8px;
   overflow: hidden;
 }
 
