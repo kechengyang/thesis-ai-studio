@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-if [ ! -d backend/.venv ]; then
-  python3 -m venv backend/.venv
+RUNTIME_DIR="$PWD/.runtime"
+VENV_DIR="$RUNTIME_DIR/python"
+PIP_CACHE_DIR="$RUNTIME_DIR/pip-cache"
+mkdir -p "$PIP_CACHE_DIR"
+if [ ! -d "$VENV_DIR" ]; then
+  python3 -m venv "$VENV_DIR"
 fi
-source backend/.venv/bin/activate
-pip install -r backend/requirements.txt
+source "$VENV_DIR/bin/activate"
+python -m pip install --cache-dir "$PIP_CACHE_DIR" -r backend/requirements.txt
 uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8001

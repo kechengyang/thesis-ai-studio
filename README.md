@@ -7,29 +7,41 @@
 在 `tool/` 文件夹中运行：
 
 ```bash
-python3 -m venv backend/.venv
-source backend/.venv/bin/activate
-pip install -r backend/requirements.txt
-cd frontend
-npm install
-cd ..
+./setup.sh
 ```
 
-然后分别启动后端和前端：
+然后一键启动：
 
 ```bash
-source backend/.venv/bin/activate
-uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8001
+./start.sh
+```
+
+打开前端提示的本地地址，通常是 `http://127.0.0.1:5173`。
+
+## 隔离环境
+
+这个项目会把运行环境放在项目自己的 `.runtime/` 文件夹中：
+
+```text
+.runtime/python      Python 虚拟环境
+.runtime/pip-cache   Python 下载缓存
+.runtime/npm-cache   npm 下载缓存
+.runtime/logs        一键启动时的日志
+```
+
+这些文件不会进入 Git。你可以删除 `.runtime/` 后重新运行 `./setup.sh`，得到一套干净环境。
+
+如果你想分别启动后端和前端：
+
+```bash
+./start-backend.sh
 ```
 
 另开一个终端：
 
 ```bash
-cd tool/frontend
-npm run dev
+./start-frontend.sh
 ```
-
-打开前端提示的本地地址，通常是 `http://127.0.0.1:5173`。
 
 ## 使用方式
 
