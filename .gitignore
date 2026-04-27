@@ -1,0 +1,9 @@
+.env
+backend/.venv/
+frontend/node_modules/
+frontend/dist/
+workspace/outputs/
+workspace/sources/*
+!workspace/sources/.gitkeep
+workspace/data/*
+!workspace/data/.gitkeep

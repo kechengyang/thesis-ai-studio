@@ -1,0 +1,6 @@
+{
+  "model": "gpt-5.5",
+  "reasoning": "medium",
+  "reference_doc": "templates/reference.docx",
+  "export_dir": "outputs"
+}
