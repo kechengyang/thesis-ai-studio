@@ -3,12 +3,15 @@ import { Bot, Loader2, Send, Trash2, User } from 'lucide-react';
 
 export function ChatPanel({
   tool,
+  title = '',
   messages,
   isBusy,
   onSend,
   onClear,
   contextSlot,
   renderResult,
+  placeholder = '输入消息... (Cmd/Ctrl+Enter 发送)',
+  sendDisabled = false,
 }) {
   const [input, setInput] = useState('');
   const bottomRef = useRef(null);
@@ -19,7 +22,7 @@ export function ChatPanel({
 
   function handleSend() {
     const text = input.trim();
-    if (!text || isBusy) return;
+    if (!text || isBusy || sendDisabled) return;
     setInput('');
     onSend(text);
   }
@@ -33,7 +36,7 @@ export function ChatPanel({
   return (
     <div className="chat-panel">
       <div className="chat-panel-header">
-        <span className="chat-panel-title">{tool} conversation</span>
+        <span className="chat-panel-title">{title || `${tool} conversation`}</span>
         <button
           className="chat-clear-btn"
           disabled={isBusy || messages.length === 0}
@@ -88,13 +91,13 @@ export function ChatPanel({
             disabled={isBusy}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="输入消息... (Cmd/Ctrl+Enter 发送)"
+            placeholder={placeholder}
             rows={2}
             value={input}
           />
           <button
             className="primary chat-send-btn"
-            disabled={isBusy || !input.trim()}
+            disabled={isBusy || !input.trim() || sendDisabled}
             onClick={handleSend}
             title="发送 (Cmd+Enter)"
             type="button"

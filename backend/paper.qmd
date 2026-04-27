@@ -1,0 +1,30 @@
+---
+title: "Working Paper Title"
+author: "Author Name"
+format:
+  docx:
+    toc: true
+bibliography: references.bib
+---
+
+# Abstract
+
+Write your abstract here. Select any paragraph and ask the AI panel to revise, expand, or check the logic.
+
+# Introduction
+
+Introduce the research background, research question, and contribution.
+
+# Methods
+
+Describe the research design, data sources, and analytical strategy.
+
+# Results
+
+Present the main findings. Figures can be placed in the `figures/` folder and referenced with Quarto syntax.
+
+# Discussion
+
+Interpret the findings, discuss limitations, and connect the argument to the literature.
+
+# References

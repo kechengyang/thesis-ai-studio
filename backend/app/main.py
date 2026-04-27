@@ -19,6 +19,7 @@ from .analysis_skills import (
     chat_data_turn,
     chat_mindmap_turn,
     dataframe_profile,
+    insert_block_into_section,
     insert_figure_into_manuscript,
     insert_mermaid_into_manuscript,
     load_tabular_data,
@@ -45,10 +46,13 @@ from .config import (
     update_env_values,
 )
 from .literature import (
+    build_google_scholar_search_url,
     build_literature_prompt,
     cache_literature_result,
     import_literature_source,
-    resolve_literature_candidate,
+    load_cached_literature,
+    save_literature_review_output,
+    search_literature_candidates,
 )
 from .providers import get_provider, provider_payload
 from .schemas import (
@@ -65,6 +69,9 @@ from .schemas import (
     MindmapInsertRequest,
     MindmapRequest,
     ProjectCreate,
+    ProjectFileDelete,
+    ProjectFileMove,
+    ProjectFileRename,
     ProjectOpen,
     RejectRequest,
     SettingsUpdate,
@@ -123,6 +130,14 @@ app.add_middleware(
 WORKSPACE_REQUIRED_MESSAGE = "请先选择 Workspace 文件夹。"
 WORKSPACE_MISSING_MESSAGE = "当前 Workspace 文件夹不存在，请重新选择。"
 WORKSPACE_INVALID_MESSAGE = "当前 Workspace 路径不是文件夹，请重新选择。"
+CATEGORY_DIRECTORY_MAP = {
+    "Project Root": "",
+    "Data": "data",
+    "Figures": "figures",
+    "Templates": "templates",
+    "Outputs": "outputs",
+}
+DRAGGABLE_CATEGORIES = tuple(CATEGORY_DIRECTORY_MAP.keys())
 
 
 def slugify(value: str) -> str:
@@ -598,6 +613,91 @@ def file_size_label(size: int) -> str:
     return f"{size / (1024 * 1024):.1f} MB"
 
 
+def project_relative_path(path: Path, project: Path) -> str:
+    return str(path.relative_to(project))
+
+
+def list_source_entries(project: Path) -> list[dict[str, Any]]:
+    index_path = project / "sources" / "sources_index.json"
+    if not index_path.exists():
+        return []
+    try:
+        items = json.loads(index_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def write_source_entries(project: Path, items: list[dict[str, Any]]) -> None:
+    (project / "sources" / "sources_index.json").write_text(json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def source_entry_for_path(project: Path, path: Path) -> dict[str, Any] | None:
+    name = path.name
+    for item in list_source_entries(project):
+        if item.get("filename") == name or item.get("text_file") == name:
+            return item
+    return None
+
+
+def project_file_category(project: Path, path: Path) -> str:
+    relative = path.relative_to(project)
+    parts = relative.parts
+    if len(parts) == 1:
+        if path.suffix.lower() == ".qmd" or path.name == "references.bib":
+            return "Manuscript"
+        return "Project Root"
+    if parts[0] == "sources":
+        return "Sources"
+    if parts[0] == "data":
+        return "Data"
+    if parts[0] == "figures":
+        return "Figures"
+    if parts[0] == "templates":
+        return "Templates"
+    if parts[0] == "outputs":
+        return "Outputs"
+    if parts[0] == "memory":
+        return "Memory"
+    return "Project Root"
+
+
+def move_targets_for_file(category: str, source_entry: dict[str, Any] | None, path: Path) -> list[str]:
+    if category not in DRAGGABLE_CATEGORIES:
+        return []
+    if source_entry:
+        return []
+    if path.suffix.lower() == ".qmd":
+        return []
+    return [item for item in DRAGGABLE_CATEGORIES if item != category]
+
+
+def project_file_actions(project: Path, path: Path, category: str) -> dict[str, Any]:
+    source_entry = source_entry_for_path(project, path) if category == "Sources" else None
+    source_filename = str(source_entry.get("filename", "")).strip() if source_entry else ""
+    source_text_file = str(source_entry.get("text_file", "")).strip() if source_entry else ""
+    is_source_sidecar = bool(source_entry and path.name == source_text_file and source_filename and source_filename != source_text_file)
+    is_manuscript = category == "Manuscript" and path.suffix.lower() == ".qmd"
+    is_protected = (
+        path.name == "references.bib"
+        or category == "Memory"
+        or is_source_sidecar
+    )
+    can_delete = not is_protected
+    if is_manuscript and len(manuscript_paths(project)) <= 1:
+        can_delete = False
+    can_rename = not is_protected
+    can_move = bool(move_targets_for_file(category, source_entry, path))
+    return {
+        "can_rename": can_rename,
+        "can_delete": can_delete,
+        "can_move": can_move,
+        "move_targets": move_targets_for_file(category, source_entry, path),
+    }
+
+
 def list_project_files(project: Path) -> list[dict[str, Any]]:
     manuscript_files = manuscript_paths(project)
     manuscript_names = {path.name for path in manuscript_files}
@@ -634,10 +734,203 @@ def list_project_files(project: Path) -> list[dict[str, Any]]:
                     "size_label": file_size_label(path.stat().st_size),
                     "modified_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
                     "extension": path.suffix.lower().lstrip(".") or "file",
+                    **project_file_actions(project, path, category),
                 }
             )
         result.append({"category": category, "files": files})
     return result
+
+
+def ensure_same_project_path(project: Path, path: Path) -> None:
+    try:
+        path.resolve().relative_to(project.resolve())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="文件路径不安全。") from exc
+
+
+def target_directory_for_category(project: Path, category: str) -> Path:
+    if category not in CATEGORY_DIRECTORY_MAP:
+        raise HTTPException(status_code=400, detail="不能拖到这个分组。")
+    relative = CATEGORY_DIRECTORY_MAP[category]
+    return project if not relative else project / relative
+
+
+def requested_filename(path: Path, new_name: str) -> str:
+    candidate = Path(str(new_name or "").strip()).name.strip()
+    if not candidate or candidate in {".", ".."}:
+        raise HTTPException(status_code=400, detail="请输入有效的文件名。")
+    if path.suffix.lower() == ".qmd":
+        stem = slugify(Path(candidate).stem)
+        if not stem:
+            raise HTTPException(status_code=400, detail="请输入有效的 qmd 文件名。")
+        return f"{stem}.qmd"
+    if "." not in Path(candidate).name and path.suffix:
+        return f"{candidate}{path.suffix}"
+    return candidate
+
+
+def update_active_manuscript_reference(project: Path, old_name: str, new_name: str | None = None) -> None:
+    project_key = workspace_state_key(project)
+    state = read_state()
+    active_manuscripts = state.get("active_manuscripts", {})
+    current = str(active_manuscripts.get(project_key, "")).strip()
+    if current != old_name:
+        return
+    active_manuscripts[project_key] = new_name or default_manuscript_name(project)
+    merge_state(active_manuscripts=active_manuscripts)
+
+
+def migrate_editor_chat_history(project: Path, old_name: str, new_name: str | None = None) -> None:
+    old_path = chat_history_path("editor", project, chat_key=old_name)
+    if not old_path.exists():
+        return
+    if not new_name:
+        old_path.unlink(missing_ok=True)
+        return
+    new_path = chat_history_path("editor", project, chat_key=new_name)
+    if new_path == old_path:
+        return
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    if new_path.exists():
+        with new_path.open("a", encoding="utf-8") as handle:
+            handle.write(old_path.read_text(encoding="utf-8", errors="ignore"))
+        old_path.unlink(missing_ok=True)
+        return
+    old_path.rename(new_path)
+
+
+def rename_source_managed_file(project: Path, entry: dict[str, Any], new_name: str) -> dict[str, Any]:
+    original_name = str(entry.get("filename", "")).strip()
+    text_name = str(entry.get("text_file", "")).strip()
+    visible_name = original_name if original_name and (project / "sources" / original_name).exists() else text_name
+    current_path = project_file_path(f"sources/{visible_name}")
+    new_stem = Path(requested_filename(current_path, new_name)).stem
+    if not new_stem:
+        raise HTTPException(status_code=400, detail="请输入有效的文件名。")
+    updated_original_name = f"{new_stem}{Path(original_name or visible_name).suffix}" if original_name else ""
+    updated_text_name = f"{new_stem}.txt" if text_name else ""
+    planned: dict[Path, Path] = {}
+    if original_name:
+        src = project / "sources" / original_name
+        dst = project / "sources" / updated_original_name
+        if src.exists():
+            planned[src] = dst
+    if text_name:
+        src = project / "sources" / text_name
+        dst = project / "sources" / updated_text_name
+        if src.exists():
+            planned[src] = dst
+    for src, dst in planned.items():
+        ensure_same_project_path(project, dst)
+        if dst.exists() and dst != src:
+            raise HTTPException(status_code=409, detail="目标文件名已存在。")
+    for src, dst in planned.items():
+        if src != dst:
+            src.rename(dst)
+    items = list_source_entries(project)
+    for item in items:
+        if item is entry or (
+            item.get("filename") == entry.get("filename")
+            and item.get("text_file") == entry.get("text_file")
+        ):
+            item["filename"] = updated_original_name or updated_text_name
+            item["text_file"] = updated_text_name or updated_original_name
+            break
+    write_source_entries(project, items)
+    final_name = updated_original_name or updated_text_name
+    return {
+        "filename": final_name,
+        "relative_path": f"sources/{final_name}",
+        "category": "Sources",
+    }
+
+
+def delete_source_managed_file(project: Path, entry: dict[str, Any]) -> None:
+    original_name = str(entry.get("filename", "")).strip()
+    text_name = str(entry.get("text_file", "")).strip()
+    for name in {original_name, text_name}:
+        if not name:
+            continue
+        path = project / "sources" / name
+        if path.exists() and path.is_file():
+            path.unlink()
+    items = [
+        item
+        for item in list_source_entries(project)
+        if not (
+            item.get("filename") == entry.get("filename")
+            and item.get("text_file") == entry.get("text_file")
+        )
+    ]
+    write_source_entries(project, items)
+
+
+def rename_project_file(project: Path, relative_path: str, new_name: str) -> dict[str, Any]:
+    current = project_file_path(relative_path)
+    category = project_file_category(project, current)
+    actions = project_file_actions(project, current, category)
+    if not actions["can_rename"]:
+        raise HTTPException(status_code=409, detail="这个文件当前不允许重命名。")
+    source_entry = source_entry_for_path(project, current) if category == "Sources" else None
+    if source_entry:
+        return rename_source_managed_file(project, source_entry, new_name)
+    next_name = requested_filename(current, new_name)
+    target = current.with_name(next_name)
+    ensure_same_project_path(project, target)
+    if target.exists() and target != current:
+        raise HTTPException(status_code=409, detail="目标文件名已存在。")
+    if target != current:
+        current.rename(target)
+    old_relative = project_relative_path(current, project)
+    new_relative = project_relative_path(target, project)
+    if category == "Manuscript" and current.suffix.lower() == ".qmd":
+        update_active_manuscript_reference(project, old_relative, new_relative)
+        migrate_editor_chat_history(project, old_relative, new_relative)
+    return {
+        "filename": target.name,
+        "relative_path": new_relative,
+        "category": project_file_category(project, target),
+    }
+
+
+def move_project_file(project: Path, relative_path: str, target_category: str) -> dict[str, Any]:
+    current = project_file_path(relative_path)
+    current_category = project_file_category(project, current)
+    actions = project_file_actions(project, current, current_category)
+    if target_category not in actions["move_targets"]:
+        raise HTTPException(status_code=409, detail="这个文件当前不能拖到该分组。")
+    target_dir = target_directory_for_category(project, target_category)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / current.name
+    ensure_same_project_path(project, target)
+    if target.exists() and target != current:
+        raise HTTPException(status_code=409, detail="目标位置已存在同名文件。")
+    if target != current:
+        current.rename(target)
+    return {
+        "filename": target.name,
+        "relative_path": project_relative_path(target, project),
+        "category": target_category,
+    }
+
+
+def delete_project_file(project: Path, relative_path: str) -> None:
+    current = project_file_path(relative_path)
+    category = project_file_category(project, current)
+    actions = project_file_actions(project, current, category)
+    if not actions["can_delete"]:
+        if category == "Manuscript" and current.suffix.lower() == ".qmd" and len(manuscript_paths(project)) <= 1:
+            raise HTTPException(status_code=409, detail="至少保留一个 qmd 文稿。")
+        raise HTTPException(status_code=409, detail="这个文件当前不允许删除。")
+    source_entry = source_entry_for_path(project, current) if category == "Sources" else None
+    if source_entry:
+        delete_source_managed_file(project, source_entry)
+        return
+    old_relative = project_relative_path(current, project)
+    current.unlink()
+    if category == "Manuscript" and current.suffix.lower() == ".qmd":
+        update_active_manuscript_reference(project, old_relative, None)
+        migrate_editor_chat_history(project, old_relative, None)
 
 
 def now_iso() -> str:
@@ -669,6 +962,96 @@ def excerpt(text: str, limit: int = 700) -> str:
     if len(compact) <= limit:
         return compact
     return compact[:limit].rstrip() + "..."
+
+
+def editor_asset_excerpt(path: Path, limit: int = 900) -> str:
+    suffix = path.suffix.lower()
+    if suffix not in {".md", ".txt", ".json", ".mmd", ".qmd"}:
+        return ""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return ""
+    if not raw:
+        return ""
+    if suffix == ".json":
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return excerpt(raw, limit=limit)
+        if isinstance(payload, dict):
+            fields = [
+                payload.get("prompt"),
+                payload.get("summary"),
+                payload.get("content"),
+                payload.get("generated_code"),
+            ]
+            metadata = payload.get("metadata")
+            if isinstance(metadata, dict):
+                fields.extend([
+                    metadata.get("analysis_title"),
+                    metadata.get("summary"),
+                    metadata.get("content"),
+                    metadata.get("data_result"),
+                    metadata.get("insert_paragraph"),
+                    metadata.get("figure_relative_path"),
+                ])
+            raw = "\n".join(str(item).strip() for item in fields if str(item or "").strip())
+            if not raw:
+                raw = json.dumps(payload, ensure_ascii=False)
+    return excerpt(raw, limit=limit)
+
+
+def build_editor_asset_inventory(project: Path) -> dict[str, Any]:
+    inventory = list_project_files(project)
+    categories = {item.get("category", ""): item.get("files", []) for item in inventory}
+    data_files = [
+        {
+            "name": item.get("name", ""),
+            "relative_path": item.get("relative_path", ""),
+        }
+        for item in categories.get("Data", [])[:12]
+    ]
+    figures = [
+        {
+            "name": item.get("name", ""),
+            "relative_path": item.get("relative_path", ""),
+        }
+        for item in categories.get("Figures", [])[:12]
+    ]
+    sources = [
+        {
+            "filename": item.get("filename", ""),
+            "text_file": item.get("text_file", ""),
+            "downloaded_original": bool(item.get("downloaded_original")),
+        }
+        for item in read_source_index()[:12]
+    ]
+
+    outputs = []
+    output_paths = [
+        path for path in sorted((project / "outputs").rglob("*"))
+        if path.is_file() and path.name != ".gitkeep"
+    ][:12]
+    for path in output_paths:
+        relative_path = str(path.relative_to(project))
+        entry = {
+            "name": path.name,
+            "relative_path": relative_path,
+            "extension": path.suffix.lower().lstrip(".") or "file",
+        }
+        if relative_path:
+            asset_excerpt = editor_asset_excerpt(path)
+            if asset_excerpt:
+                entry["excerpt"] = asset_excerpt
+        outputs.append(entry)
+
+    return {
+        "data_files": data_files,
+        "figures": figures,
+        "sources": sources,
+        "outputs": outputs,
+    }
 
 
 def memory_summary_text(project: Path, limit: int = 4000) -> str:
@@ -829,19 +1212,118 @@ def search_sources(query: str, limit: int = 5) -> list[dict[str, str]]:
     return [{"filename": filename, "text": text} for _, filename, text in scored[:limit]]
 
 
+def read_source_entry(project: Path, filename: str = "", text_file: str = "") -> dict[str, Any] | None:
+    wanted_filename = str(filename or "").strip()
+    wanted_text_file = str(text_file or "").strip()
+    if not wanted_filename and not wanted_text_file:
+        return None
+    for item in read_source_index():
+        if wanted_filename and item.get("filename") == wanted_filename:
+            return item
+        if wanted_text_file and item.get("text_file") == wanted_text_file:
+            return item
+    return None
+
+
+def focused_source_hits(project: Path, source_entry: dict[str, Any] | None, query: str, limit: int = 5) -> list[dict[str, str]]:
+    if not source_entry:
+        return []
+    text_file = str(source_entry.get("text_file", "")).strip()
+    if not text_file:
+        return []
+    text_path = project / "sources" / text_file
+    if not text_path.exists():
+        return []
+
+    terms = [term.lower() for term in re.findall(r"[\w\-]{2,}", query)]
+    candidates = []
+    for chunk in chunks(text_path.read_text(encoding="utf-8", errors="ignore"), size=1200):
+        lower = chunk.lower()
+        score = sum(lower.count(term) for term in terms) if terms else 0
+        if not terms:
+            score = 1
+        if score > 0:
+            candidates.append((score, chunk))
+    candidates.sort(key=lambda row: row[0], reverse=True)
+    selected = candidates[:limit] if candidates else []
+    if not selected:
+        selected = [(1, chunk) for chunk in chunks(text_path.read_text(encoding="utf-8", errors="ignore"), size=1200)[:limit]]
+    return [{"filename": source_entry.get("filename", text_file), "text": text} for _, text in selected[:limit]]
+
+
+def build_literature_chat_context(req: ChatRequest, project: Path) -> dict[str, Any]:
+    document = paper_path().read_text(encoding="utf-8")
+    outline = outline_from_document(document)
+    cache_id = str(req.context.get("cache_id", "")).strip()
+    source_filename = str(req.context.get("filename", "")).strip()
+    text_file = str(req.context.get("text_file", "")).strip()
+    should_search_fresh = not cache_id and not source_filename and not text_file
+    bundle = search_literature_candidates(req.message) if should_search_fresh else {
+        "candidate": {},
+        "search_results": [],
+        "scholar_search_url": "",
+        "query_kind": "focus",
+    }
+    candidate = dict(bundle["candidate"] or {})
+    cached_analysis: dict[str, Any] = {}
+
+    if cache_id:
+        try:
+            cached = load_cached_literature(cache_id)
+            candidate = dict(cached.get("candidate") or candidate)
+            cached_analysis = dict(cached.get("analysis") or {})
+        except HTTPException:
+            pass
+
+    source_entry = read_source_entry(project, filename=source_filename, text_file=text_file)
+    source_hits = focused_source_hits(project, source_entry, req.message or candidate.get("title", ""), limit=4)
+    if not source_hits and (req.message or candidate.get("title")):
+        source_hits = search_sources(f"{candidate.get('title', '')}\n{req.message}".strip(), limit=4)
+
+    source_focus = None
+    if source_entry:
+        source_focus = {
+            "filename": source_entry.get("filename", ""),
+            "text_file": source_entry.get("text_file", ""),
+            "title": candidate.get("title", "") or source_entry.get("filename", ""),
+            "downloaded_original": bool(source_entry.get("downloaded_original")),
+        }
+
+    candidate.setdefault("excerpt", "")
+    if not bundle.get("scholar_search_url") and candidate.get("title"):
+        bundle["scholar_search_url"] = build_google_scholar_search_url(candidate.get("title", ""))
+    return {
+        "candidate": candidate,
+        "cached_analysis": cached_analysis,
+        "search_results": bundle.get("search_results", []),
+        "scholar_search_url": bundle.get("scholar_search_url", ""),
+        "query_kind": bundle.get("query_kind", "query"),
+        "outline": outline,
+        "source_focus": source_focus,
+        "imported_source_excerpts": source_hits,
+    }
+
+
 def new_memory_id(prefix: str) -> str:
     return f"{prefix}-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
 
 
-VALID_CHAT_TOOLS = {"literature", "data", "mindmap", "brief"}
+VALID_CHAT_TOOLS = {"literature", "data", "mindmap", "brief", "editor"}
 
 
-def chat_history_path(tool: str, project: Optional[Path] = None) -> Path:
-    return (project or workspace_path()) / "memory" / "chats" / f"{tool}.jsonl"
+def normalize_chat_key(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip()).strip("._-")
+    return cleaned[:80]
 
 
-def load_chat_history(tool: str, project: Optional[Path] = None) -> list[dict[str, Any]]:
-    path = chat_history_path(tool, project)
+def chat_history_path(tool: str, project: Optional[Path] = None, chat_key: str = "") -> Path:
+    safe_key = normalize_chat_key(chat_key)
+    suffix = f"__{safe_key}" if safe_key else ""
+    return (project or workspace_path()) / "memory" / "chats" / f"{tool}{suffix}.jsonl"
+
+
+def load_chat_history(tool: str, project: Optional[Path] = None, chat_key: str = "") -> list[dict[str, Any]]:
+    path = chat_history_path(tool, project, chat_key=chat_key)
     if not path.exists():
         return []
     rows = []
@@ -861,18 +1343,267 @@ def append_chat_messages(
     project: Path,
     user_msg: dict[str, Any],
     assistant_msg: dict[str, Any],
+    chat_key: str = "",
 ) -> None:
-    path = chat_history_path(tool, project)
+    path = chat_history_path(tool, project, chat_key=chat_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(user_msg, ensure_ascii=False) + "\n")
         handle.write(json.dumps(assistant_msg, ensure_ascii=False) + "\n")
 
 
-def clear_chat_history(tool: str, project: Path) -> None:
-    path = chat_history_path(tool, project)
+def clear_chat_history(tool: str, project: Path, chat_key: str = "") -> None:
+    path = chat_history_path(tool, project, chat_key=chat_key)
     if path.exists():
         path.write_text("", encoding="utf-8")
+
+
+def contextual_document_excerpt(document: str, selected_text: str, radius: int = 1200) -> str:
+    if not document:
+        return ""
+    needle = str(selected_text or "").strip()
+    if not needle:
+        return excerpt(document, limit=6000)
+    start = document.find(needle)
+    if start < 0:
+        return excerpt(document, limit=6000)
+    end = start + len(needle)
+    snippet_start = max(0, start - radius)
+    snippet_end = min(len(document), end + radius)
+    snippet = document[snippet_start:snippet_end]
+    if snippet_start > 0:
+        snippet = f"...{snippet}"
+    if snippet_end < len(document):
+        snippet = f"{snippet}..."
+    return snippet
+
+
+def manuscript_section_snapshots(document: str, per_section_limit: int = 420, max_sections: int = 12) -> list[dict[str, str]]:
+    snapshots: list[dict[str, str]] = []
+    active_title = "Preamble"
+    active_level = 0
+    active_lines: list[str] = []
+
+    def flush_section() -> None:
+        nonlocal active_lines
+        body = "\n".join(active_lines).strip()
+        if not body and active_level > 0:
+            snapshots.append({"title": active_title, "level": str(active_level), "excerpt": ""})
+        elif body:
+            snapshots.append(
+                {
+                    "title": active_title,
+                    "level": str(active_level),
+                    "excerpt": excerpt(body, limit=per_section_limit),
+                }
+            )
+        active_lines = []
+
+    for line in document.splitlines():
+        match = re.match(r"^(#{1,6})\s+(.+)$", line.strip())
+        if match:
+            if active_lines or snapshots:
+                flush_section()
+            active_title = match.group(2).strip()
+            active_level = len(match.group(1))
+            continue
+        active_lines.append(line)
+    if active_lines or not snapshots:
+        flush_section()
+    return snapshots[:max_sections]
+
+
+def build_editor_chat_context(req: ChatRequest, project: Path) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    document = str(req.context.get("document", "") or paper_path().read_text(encoding="utf-8"))
+    selected_text = str(req.context.get("selected_text", "")).strip()
+    source_hits = search_sources(f"{req.message}\n{selected_text}".strip()) if (req.message or selected_text) else []
+    recent_turns = []
+    for msg in req.history[-6:]:
+        item: dict[str, Any] = {
+            "role": msg.role,
+            "content": msg.content,
+        }
+        selected_from_context = str(msg.context.get("selected_text", "")) if msg.context else ""
+        selected_from_result = str(msg.result.get("selected_text", "")) if msg.result else ""
+        effective_selected_text = selected_from_context.strip() or selected_from_result.strip()
+        if effective_selected_text:
+            item["selected_text"] = excerpt(effective_selected_text, limit=600)
+        if msg.result:
+            rewritten = str(msg.result.get("rewritten_text", "")).strip()
+            rationale = str(msg.result.get("rationale", "")).strip()
+            tool_results = msg.result.get("tool_results") if isinstance(msg.result.get("tool_results"), list) else []
+            if rewritten:
+                item["rewritten_text"] = excerpt(rewritten, limit=1200)
+            if rationale:
+                item["rationale"] = rationale
+            if tool_results:
+                item["tool_results"] = [
+                    {
+                        "type": result.get("type", ""),
+                        "status": result.get("status", ""),
+                        "summary": excerpt(
+                            str(
+                                result.get("summary")
+                                or result.get("literature_review")
+                                or result.get("data_result")
+                                or result.get("title")
+                                or result.get("error")
+                                or ""
+                            ),
+                            limit=240,
+                        ),
+                    }
+                    for result in tool_results[:3]
+                ]
+        recent_turns.append(item)
+    return (
+        {
+            "active_manuscript": req.context.get("active_manuscript") or paper_path().name,
+            "selection_mode": "explicit" if selected_text else "auto",
+            "selected_text": selected_text,
+            "manuscript_excerpt": contextual_document_excerpt(document, selected_text),
+            "manuscript_section_snapshots": manuscript_section_snapshots(document),
+            "project_asset_inventory": build_editor_asset_inventory(project),
+            "paper_outline": outline_from_document(document),
+            "local_sources": source_hits,
+            "project_memory": build_memory_context(project),
+            "recent_editor_turns": recent_turns,
+        },
+        source_hits,
+    )
+
+
+def upsert_source_index_entry(entry: dict[str, Any]) -> None:
+    items = [item for item in read_source_index() if item.get("filename") != entry.get("filename")]
+    items.append(entry)
+    write_source_index(items)
+
+
+def execute_editor_tool_actions(
+    project: Path,
+    provider: Any,
+    settings: dict[str, Any],
+    tool_actions: list[dict[str, Any]],
+    user_message: str,
+    document: str,
+    outline: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+
+    for action in tool_actions[:2]:
+        action_type = str(action.get("type", "")).strip()
+        base_result = {
+            "type": action_type,
+            "reason": str(action.get("reason", "")).strip(),
+            "status": "ok",
+        }
+        try:
+            if action_type == "import_literature":
+                query = str(action.get("query", "")).strip()
+                bundle = search_literature_candidates(query)
+                candidate = bundle["candidate"]
+                candidate.setdefault("excerpt", "")
+                prompt = build_literature_prompt(query, candidate, outline)
+                model_result = provider.analyze_literature(settings, prompt)
+                analysis = model_result["analysis"]
+                analysis["title"] = analysis.get("title") or candidate.get("title", "")
+                analysis["authors"] = analysis.get("authors") or candidate.get("authors", [])
+                analysis["year"] = analysis.get("year") or candidate.get("year", "")
+                analysis["venue"] = analysis.get("venue") or candidate.get("venue", "")
+                output_relative_path = save_literature_review_output(project, candidate, analysis)
+                cached_payload = {
+                    "query": query,
+                    "candidate": candidate,
+                    "analysis": analysis,
+                    "raw": model_result.get("raw", ""),
+                    "created_at": now_iso(),
+                }
+                cache_id = cache_literature_result(cached_payload)
+                source_entry = import_literature_source(cache_id, project, bool(action.get("download_original")))
+                upsert_source_index_entry(source_entry)
+                results.append(
+                    {
+                        **base_result,
+                        "query": query,
+                        "cache_id": cache_id,
+                        "candidate_title": candidate.get("title", ""),
+                        "source_filename": source_entry.get("filename", ""),
+                        "downloaded_original": bool(source_entry.get("downloaded_original")),
+                        "literature_review": analysis.get("literature_review", ""),
+                        "summary": analysis.get("summary", ""),
+                        "output_relative_path": output_relative_path,
+                    }
+                )
+                continue
+
+            if action_type == "create_data_figure":
+                relative_path = str(action.get("data_relative_path", "")).strip()
+                prompt = str(action.get("prompt", "")).strip() or user_message
+                analysis_result = run_data_analysis_skill(project, provider, settings, relative_path, prompt, outline)["analysis"]
+                results.append(
+                    {
+                        **base_result,
+                        "data_relative_path": relative_path,
+                        "figure_relative_path": analysis_result.get("figure_relative_path", ""),
+                        "figure_title": analysis_result.get("figure_title", ""),
+                        "figure_caption": analysis_result.get("figure_caption", ""),
+                        "suggested_section": analysis_result.get("suggested_section", ""),
+                        "insert_paragraph": analysis_result.get("insert_paragraph", ""),
+                        "data_result": analysis_result.get("data_result", ""),
+                        "output_relative_path": analysis_result.get("record_relative_path", ""),
+                    }
+                )
+                continue
+
+            if action_type == "create_brief":
+                brief_result = run_brief_skill(
+                    project,
+                    provider,
+                    settings,
+                    str(action.get("prompt", "")).strip() or user_message,
+                    str(action.get("format", "summary")).strip() or "summary",
+                    str(action.get("scope_heading", "")).strip(),
+                    document,
+                    outline,
+                )["brief"]
+                results.append(
+                    {
+                        **base_result,
+                        "target_format": brief_result.get("target_format", ""),
+                        "title": brief_result.get("title", ""),
+                        "summary": brief_result.get("summary", ""),
+                        "one_liner": brief_result.get("one_liner", ""),
+                        "key_messages": brief_result.get("key_messages", []),
+                        "output_relative_path": brief_result.get("output_relative_path", ""),
+                    }
+                )
+                continue
+
+            results.append(
+                {
+                    **base_result,
+                    "status": "error",
+                    "error": f"Unsupported tool action: {action_type or 'unknown'}",
+                }
+            )
+        except HTTPException as exc:
+            results.append(
+                {
+                    **base_result,
+                    "status": "error",
+                    "error": str(exc.detail),
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    **base_result,
+                    "status": "error",
+                    "error": str(exc),
+                }
+            )
+
+    return results
 
 
 def build_chat_messages(
@@ -965,12 +1696,11 @@ def _chat_embedded_context(tool: str, req: ChatRequest, project: Path) -> str:
         return json.dumps(ctx, ensure_ascii=False)
 
     if tool == "literature":
-        candidate = resolve_literature_candidate(req.message)
-        candidate.setdefault("excerpt", "")
-        return json.dumps(
-            {"candidate": candidate, "outline": outline},
-            ensure_ascii=False,
-        )
+        return json.dumps(build_literature_chat_context(req, project), ensure_ascii=False)
+
+    if tool == "editor":
+        payload, _source_hits = build_editor_chat_context(req, project)
+        return json.dumps(payload, ensure_ascii=False)
 
     return ""
 
@@ -1008,14 +1738,17 @@ def run_chat_turn(
 
     elif tool == "literature":
         from .providers import literature_instructions, parse_literature_json
-        candidate = resolve_literature_candidate(req.message)
-        candidate.setdefault("excerpt", "")
+        literature_context = build_literature_chat_context(req, project)
+        candidate = literature_context["candidate"]
+        cached_analysis = literature_context.get("cached_analysis") or {}
         raw_text = provider.generate_chat_json(settings, literature_instructions(settings), messages)
         analysis = parse_literature_json(raw_text)
         analysis["title"] = analysis.get("title") or candidate.get("title", "")
         analysis["authors"] = analysis.get("authors") or candidate.get("authors", [])
         analysis["year"] = analysis.get("year") or candidate.get("year", "")
         analysis["venue"] = analysis.get("venue") or candidate.get("venue", "")
+        analysis["literature_review"] = analysis.get("literature_review") or cached_analysis.get("literature_review", "")
+        output_relative_path = save_literature_review_output(project, candidate, analysis)
         cached_payload = {
             "query": req.message,
             "candidate": candidate,
@@ -1028,9 +1761,92 @@ def run_chat_turn(
         result = {
             "analysis": analysis,
             "candidate": candidate,
+            "search_results": literature_context.get("search_results", []),
+            "scholar_search_url": literature_context.get("scholar_search_url", ""),
+            "query_kind": literature_context.get("query_kind", "query"),
+            "source_focus": literature_context.get("source_focus"),
             "cache_id": cache_id,
             "download_available": bool(candidate.get("download_url")),
+            "output_relative_path": output_relative_path,
         }
+
+    elif tool == "editor":
+        from .providers import (
+            editor_chat_instructions,
+            editor_tool_planner_instructions,
+            parse_editor_chat_json,
+            parse_editor_tool_plan_json,
+        )
+        context_payload, source_hits = build_editor_chat_context(req, project)
+        planner_messages = build_chat_messages(history_dicts, req.message, json.dumps(context_payload, ensure_ascii=False))
+        planner_raw = provider.generate_chat_json(settings, editor_tool_planner_instructions(settings), planner_messages)
+        tool_plan = parse_editor_tool_plan_json(planner_raw)
+        tool_results = execute_editor_tool_actions(
+            project,
+            provider,
+            settings,
+            tool_plan.get("tool_actions", []),
+            req.message,
+            document,
+            outline,
+        )
+        if tool_results:
+            context_payload, source_hits = build_editor_chat_context(req, project)
+        final_context = {
+            **context_payload,
+            "executed_tool_results": tool_results,
+            "requested_tool_actions": tool_plan.get("tool_actions", []),
+            "tool_planner_reason": tool_plan.get("reason", ""),
+        }
+        final_messages = build_chat_messages(history_dicts, req.message, json.dumps(final_context, ensure_ascii=False))
+        raw_text = provider.generate_chat_json(settings, editor_chat_instructions(settings), final_messages)
+        parsed = parse_editor_chat_json(raw_text)
+        selected_text = str(req.context.get("selected_text", "")).strip() or str(parsed.get("selected_text", "")).strip()
+        parsed["selected_text"] = selected_text
+        parsed["tool_actions"] = tool_plan.get("tool_actions", [])
+        parsed["tool_results"] = tool_results
+        has_actionable_operations = bool(parsed.get("operations"))
+        has_tool_side_effects = bool(tool_results)
+        suggestion_id = new_memory_id("sug") if ((parsed.get("rewritten_text") and selected_text) or has_actionable_operations or has_tool_side_effects) else ""
+        if suggestion_id:
+            append_jsonl(
+                project / "memory" / "conversations.jsonl",
+                {
+                    "id": suggestion_id,
+                    "timestamp": now_iso(),
+                    "type": "editor_chat",
+                    "instruction": req.message,
+                    "selected_text": excerpt(selected_text),
+                    "suggestion": {
+                        "selected_text": selected_text,
+                        "rewritten_text": parsed.get("rewritten_text", ""),
+                        "operations": parsed.get("operations", []),
+                        "tool_actions": parsed.get("tool_actions", []),
+                        "tool_results": parsed.get("tool_results", []),
+                        "rationale": parsed.get("rationale", ""),
+                        "process_summary": parsed.get("process_summary", []),
+                        "risks": parsed.get("risks", []),
+                        "citation_or_data_notes": parsed.get("citation_or_data_notes", []),
+                        "confidence": parsed.get("confidence", "medium"),
+                    },
+                    "source_files": sorted({source["filename"] for source in source_hits}),
+                    "raw_excerpt": excerpt(raw_text, limit=900),
+                    "status": "proposed",
+                    "chat_mode": True,
+                    "active_manuscript": context_payload.get("active_manuscript", ""),
+                },
+            )
+            append_memory_summary(
+                project,
+                f"Editor chat proposed an edit plan for: \"{excerpt(selected_text or summarize_editor_operations(parsed.get('operations', [])) or summarize_editor_tool_actions(parsed.get('tool_actions', [])), 160)}\"",
+            )
+        result = {
+            **parsed,
+            "selected_text": selected_text,
+            "suggestion_id": suggestion_id,
+            "trace": build_ai_trace(settings, source_hits, project),
+        }
+        content = parsed.get("content") or parsed.get("rationale") or "已完成这轮写作协作。"
 
     else:
         raise HTTPException(status_code=400, detail=f"未知 tool：{tool}")
@@ -1221,6 +2037,30 @@ def get_project_file(relative_path: str) -> FileResponse:
     return FileResponse(project_file_path(relative_path))
 
 
+@app.post("/api/project/file/rename")
+def rename_project_file_endpoint(req: ProjectFileRename) -> dict[str, Any]:
+    ensure_workspace()
+    project = workspace_path()
+    result = rename_project_file(project, req.relative_path, req.new_name)
+    return {"ok": True, **result}
+
+
+@app.post("/api/project/file/move")
+def move_project_file_endpoint(req: ProjectFileMove) -> dict[str, Any]:
+    ensure_workspace()
+    project = workspace_path()
+    result = move_project_file(project, req.relative_path, req.target_category)
+    return {"ok": True, **result}
+
+
+@app.post("/api/project/file/delete")
+def delete_project_file_endpoint(req: ProjectFileDelete) -> dict[str, Any]:
+    ensure_workspace()
+    project = workspace_path()
+    delete_project_file(project, req.relative_path)
+    return {"ok": True}
+
+
 @app.post("/api/document")
 def update_document(update: DocumentUpdate) -> dict[str, Any]:
     ensure_workspace()
@@ -1306,7 +2146,8 @@ def analyze_literature(req: LiteratureAnalyzeRequest) -> dict[str, Any]:
     ensure_workspace()
     provider, settings = configured_provider()
     project = workspace_path()
-    candidate = resolve_literature_candidate(req.query)
+    bundle = search_literature_candidates(req.query)
+    candidate = bundle["candidate"]
     candidate.setdefault("excerpt", "")
     outline = outline_from_document(paper_path().read_text(encoding="utf-8"))
     prompt = build_literature_prompt(req.query, candidate, outline)
@@ -1319,6 +2160,7 @@ def analyze_literature(req: LiteratureAnalyzeRequest) -> dict[str, Any]:
     analysis["authors"] = analysis.get("authors") or candidate.get("authors", [])
     analysis["year"] = analysis.get("year") or candidate.get("year", "")
     analysis["venue"] = analysis.get("venue") or candidate.get("venue", "")
+    output_relative_path = save_literature_review_output(project, candidate, analysis)
     cached_payload = {
         "query": req.query,
         "candidate": candidate,
@@ -1331,8 +2173,12 @@ def analyze_literature(req: LiteratureAnalyzeRequest) -> dict[str, Any]:
         "ok": True,
         "cache_id": cache_id,
         "candidate": candidate,
+        "search_results": bundle.get("search_results", []),
+        "scholar_search_url": bundle.get("scholar_search_url", ""),
+        "query_kind": bundle.get("query_kind", "query"),
         "analysis": analysis,
         "download_available": bool(candidate.get("download_url")),
+        "output_relative_path": output_relative_path,
     }
 
 
@@ -1440,12 +2286,12 @@ def create_brief(req: BriefRequest) -> dict[str, Any]:
 
 
 @app.get("/api/chat/{tool}")
-def get_chat_history(tool: str) -> dict[str, Any]:
+def get_chat_history(tool: str, chat_key: str = "") -> dict[str, Any]:
     if tool not in VALID_CHAT_TOOLS:
         raise HTTPException(status_code=400, detail=f"未知 tool：{tool}")
     ensure_workspace()
     project = workspace_path()
-    return {"ok": True, "tool": tool, "history": load_chat_history(tool, project)}
+    return {"ok": True, "tool": tool, "history": load_chat_history(tool, project, chat_key=chat_key)}
 
 
 @app.post("/api/chat/{tool}")
@@ -1455,6 +2301,7 @@ def post_chat_turn(tool: str, req: ChatRequest) -> dict[str, Any]:
     ensure_workspace()
     provider, settings = configured_provider()
     project = workspace_path()
+    chat_key = str(req.context.get("chat_key", "") or "")
 
     user_msg: dict[str, Any] = {
         "id": new_memory_id("msg"),
@@ -1471,16 +2318,16 @@ def post_chat_turn(tool: str, req: ChatRequest) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"AI 调用失败：{exc}") from exc
 
-    append_chat_messages(tool, project, user_msg, assistant_msg)
+    append_chat_messages(tool, project, user_msg, assistant_msg, chat_key=chat_key)
     return {"ok": True, "message": assistant_msg}
 
 
 @app.delete("/api/chat/{tool}")
-def delete_chat_history(tool: str) -> dict[str, Any]:
+def delete_chat_history(tool: str, chat_key: str = "") -> dict[str, Any]:
     if tool not in VALID_CHAT_TOOLS:
         raise HTTPException(status_code=400, detail=f"未知 tool：{tool}")
     ensure_workspace()
-    clear_chat_history(tool, workspace_path())
+    clear_chat_history(tool, workspace_path(), chat_key=chat_key)
     return {"ok": True}
 
 
@@ -1522,27 +2369,118 @@ def suggest_stream(req: SuggestRequest) -> StreamingResponse:
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+def summarize_editor_operations(operations: list[dict[str, Any]]) -> str:
+    labels: list[str] = []
+    for op in operations:
+        op_type = str(op.get("type", "")).strip()
+        if op_type == "replace_text":
+            labels.append(f"Replace: {excerpt(str(op.get('target_text', '')), 90)}")
+        elif op_type == "insert_under_heading":
+            heading = str(op.get("section_title", "")).strip() or "document end"
+            labels.append(f"Insert under {heading}: {excerpt(str(op.get('content', '')), 90)}")
+        elif op_type == "insert_figure":
+            heading = str(op.get("section_title", "")).strip() or "document end"
+            labels.append(f"Insert figure {op.get('figure_relative_path', '')} under {heading}")
+    return " | ".join(labels[:4]).strip()
+
+
+def summarize_editor_tool_actions(actions: list[dict[str, Any]]) -> str:
+    labels: list[str] = []
+    for action in actions:
+        action_type = str(action.get("type", "")).strip()
+        if action_type == "import_literature":
+            labels.append(f"Import literature: {action.get('query', '')}")
+        elif action_type == "create_data_figure":
+            labels.append(f"Create figure: {action.get('data_relative_path', '')}")
+        elif action_type == "create_brief":
+            labels.append(f"Create brief: {action.get('format', '')}")
+    return " | ".join(labels[:4]).strip()
+
+
+def apply_editor_operations(content: str, operations: list[dict[str, Any]], project: Path) -> str:
+    updated = content
+    for index, op in enumerate(operations, start=1):
+        op_type = str(op.get("type", "")).strip()
+
+        if op_type == "replace_text":
+            target_text = str(op.get("target_text", "")).strip()
+            replacement = str(op.get("replacement", "")).strip()
+            if not target_text or not replacement:
+                raise HTTPException(status_code=400, detail=f"第 {index} 个编辑动作缺少 target_text 或 replacement。")
+            if target_text not in updated:
+                raise HTTPException(status_code=409, detail=f"第 {index} 个替换目标已变化，请刷新文稿后重新生成。")
+            updated = updated.replace(target_text, replacement, 1)
+            continue
+
+        if op_type == "insert_under_heading":
+            insert_content = str(op.get("content", "")).strip()
+            if not insert_content:
+                raise HTTPException(status_code=400, detail=f"第 {index} 个插入动作缺少 content。")
+            section_title = str(op.get("section_title", "")).strip()
+            if section_title:
+                updated = insert_block_into_section(updated, section_title, insert_content)
+            else:
+                updated = updated.rstrip() + "\n\n" + insert_content + "\n"
+            continue
+
+        if op_type == "insert_figure":
+            figure_relative_path = str(op.get("figure_relative_path", "")).strip()
+            if not figure_relative_path:
+                raise HTTPException(status_code=400, detail=f"第 {index} 个 figure 动作缺少 figure_relative_path。")
+            safe_figure = project_file_path(figure_relative_path)
+            if safe_figure.suffix.lower() not in [".png", ".jpg", ".jpeg", ".svg", ".webp"]:
+                raise HTTPException(status_code=400, detail="只能把图片文件作为 figure 插入文稿。")
+            figure_title = str(op.get("figure_title", "")).strip() or safe_figure.stem.replace("-", " ").replace("_", " ").title()
+            figure_caption = str(op.get("figure_caption", "")).strip() or figure_title
+            updated = insert_figure_into_manuscript(
+                updated,
+                {
+                    "figure_relative_path": figure_relative_path,
+                    "figure_title": figure_title,
+                    "figure_caption": figure_caption,
+                    "figure_alt_text": str(op.get("figure_alt_text", "")).strip(),
+                    "section_title": str(op.get("section_title", "")).strip(),
+                    "introduction": str(op.get("introduction", "")).strip(),
+                },
+            )
+            continue
+
+        raise HTTPException(status_code=400, detail=f"不支持的编辑动作类型：{op_type or 'unknown'}。")
+
+    return updated
+
+
 @app.post("/api/ai/apply")
 def apply_suggestion(req: ApplyRequest) -> dict[str, Any]:
     ensure_workspace()
-    if not req.original_segment:
-        raise HTTPException(status_code=400, detail="缺少原文片段，无法安全替换。")
+    if not req.original_segment and not req.operations:
+        raise HTTPException(status_code=400, detail="缺少可应用的编辑动作。")
     current_paper = paper_path()
     content = current_paper.read_text(encoding="utf-8")
-    if req.original_segment not in content:
-        raise HTTPException(status_code=409, detail="原文片段已经变化，请重新选择段落后再应用。")
-    updated = content.replace(req.original_segment, req.replacement, 1)
+    project = workspace_path()
+
+    if req.operations:
+        updated = apply_editor_operations(content, req.operations, project)
+    else:
+        original_segment = str(req.original_segment or "").strip()
+        if not original_segment:
+            raise HTTPException(status_code=400, detail="缺少原文片段，无法安全替换。")
+        if original_segment not in content:
+            raise HTTPException(status_code=409, detail="原文片段已经变化，请重新选择段落后再应用。")
+        updated = content.replace(original_segment, req.replacement, 1)
+
     current_paper.write_text(updated, encoding="utf-8")
     log_change(
-        workspace_path(),
+        project,
         {
             "id": new_memory_id("chg"),
             "suggestion_id": req.suggestion_id,
             "timestamp": now_iso(),
             "type": "edit",
             "status": "accepted",
-            "original_segment": excerpt(req.original_segment, limit=900),
-            "replacement": excerpt(req.replacement, limit=900),
+            "original_segment": excerpt(str(req.original_segment or summarize_editor_operations(req.operations)), limit=900),
+            "replacement": excerpt(str(req.replacement or summarize_editor_operations(req.operations)), limit=900),
+            "operations": req.operations,
         },
     )
     return {"ok": True, "content": updated, "outline": outline_from_document(updated)}
@@ -1551,6 +2489,12 @@ def apply_suggestion(req: ApplyRequest) -> dict[str, Any]:
 @app.post("/api/ai/reject")
 def reject_suggestion(req: RejectRequest) -> dict[str, Any]:
     ensure_workspace()
+    original_segment = str(req.original_segment or "")
+    operations = []
+    if isinstance(req.suggestion, dict):
+        maybe_ops = req.suggestion.get("operations")
+        if isinstance(maybe_ops, list):
+            operations = maybe_ops
     log_change(
         workspace_path(),
         {
@@ -1559,8 +2503,9 @@ def reject_suggestion(req: RejectRequest) -> dict[str, Any]:
             "timestamp": now_iso(),
             "type": "edit",
             "status": "rejected",
-            "original_segment": excerpt(req.original_segment, limit=900),
+            "original_segment": excerpt(original_segment or summarize_editor_operations(operations), limit=900),
             "suggestion": req.suggestion or {},
+            "operations": operations,
         },
     )
     return {"ok": True, "memory": memory_overview(workspace_path())}

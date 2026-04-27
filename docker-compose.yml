@@ -1,0 +1,41 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    working_dir: /app
+    command: >
+      sh -c "uv pip install --system -r backend/requirements.txt
+      && python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8011 --reload"
+    env_file:
+      - .env
+    environment:
+      THESIS_PROJECTS_ROOT: /app/.runtime/projects
+      WATCHFILES_FORCE_POLLING: "true"
+      MPLBACKEND: Agg
+    ports:
+      - "${BACKEND_PORT:-8011}:8011"
+    volumes:
+      - .:/app
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    working_dir: /app/frontend
+    command: >
+      sh -c "if [ ! -d node_modules ] || [ -z \"$(ls -A node_modules 2>/dev/null)\" ]; then npm ci; fi
+      && npm run dev -- --host 0.0.0.0 --port 5183 --strictPort"
+    depends_on:
+      - backend
+    environment:
+      VITE_API_BASE: "http://127.0.0.1:${BACKEND_PORT:-8011}/api"
+      CHOKIDAR_USEPOLLING: "true"
+    ports:
+      - "${FRONTEND_PORT:-5183}:5183"
+    volumes:
+      - .:/app
+      - frontend_node_modules:/app/frontend/node_modules
+
+volumes:
+  frontend_node_modules:

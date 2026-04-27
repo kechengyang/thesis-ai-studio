@@ -38,6 +38,163 @@ def normalize_text_list(value: Any) -> list[str]:
     return [text] if text else []
 
 
+def normalize_editor_operations(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+
+    operations: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        op_type = str(
+            item.get("type")
+            or item.get("action")
+            or item.get("kind")
+            or item.get("operation")
+            or "",
+        ).strip().lower()
+        summary = str(item.get("summary") or item.get("label") or "").strip()
+
+        if op_type in {"replace", "replace_text", "rewrite"}:
+            target_text = str(
+                item.get("target_text")
+                or item.get("selected_text")
+                or item.get("original_text")
+                or item.get("source_text")
+                or "",
+            ).strip()
+            replacement = str(
+                item.get("replacement")
+                or item.get("rewritten_text")
+                or item.get("content")
+                or "",
+            ).strip()
+            if target_text and replacement:
+                operations.append(
+                    {
+                        "type": "replace_text",
+                        "summary": summary,
+                        "target_text": target_text,
+                        "replacement": replacement,
+                    }
+                )
+            continue
+
+        if op_type in {"insert_under_heading", "insert_heading", "insert_text", "insert_markdown"}:
+            content = str(
+                item.get("content")
+                or item.get("markdown")
+                or item.get("text")
+                or item.get("body")
+                or "",
+            ).strip()
+            section_title = str(
+                item.get("section_title")
+                or item.get("heading")
+                or item.get("section")
+                or "",
+            ).strip()
+            if content:
+                operations.append(
+                    {
+                        "type": "insert_under_heading",
+                        "summary": summary,
+                        "section_title": section_title,
+                        "content": content,
+                    }
+                )
+            continue
+
+        if op_type in {"insert_figure", "figure"}:
+            figure_relative_path = str(
+                item.get("figure_relative_path")
+                or item.get("relative_path")
+                or item.get("path")
+                or "",
+            ).strip()
+            if figure_relative_path:
+                operations.append(
+                    {
+                        "type": "insert_figure",
+                        "summary": summary,
+                        "section_title": str(item.get("section_title") or item.get("heading") or "").strip(),
+                        "figure_relative_path": figure_relative_path,
+                        "figure_title": str(item.get("figure_title") or item.get("title") or "").strip(),
+                        "figure_caption": str(item.get("figure_caption") or item.get("caption") or "").strip(),
+                        "figure_alt_text": str(item.get("figure_alt_text") or item.get("alt_text") or "").strip(),
+                        "introduction": str(item.get("introduction") or item.get("content") or "").strip(),
+                    }
+                )
+            continue
+
+    return operations
+
+
+def normalize_editor_tool_actions(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+
+    actions: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        action_type = str(
+            item.get("type")
+            or item.get("action")
+            or item.get("tool")
+            or "",
+        ).strip().lower()
+        reason = str(item.get("reason") or item.get("summary") or "").strip()
+
+        if action_type in {"import_literature", "literature"}:
+            query = str(item.get("query") or item.get("title") or item.get("input") or "").strip()
+            if query:
+                actions.append(
+                    {
+                        "type": "import_literature",
+                        "reason": reason,
+                        "query": query,
+                        "download_original": bool(item.get("download_original") or item.get("download_pdf") or False),
+                    }
+                )
+            continue
+
+        if action_type in {"create_data_figure", "data_figure", "analyze_data"}:
+            data_relative_path = str(
+                item.get("data_relative_path")
+                or item.get("relative_path")
+                or item.get("data_file")
+                or "",
+            ).strip()
+            prompt = str(item.get("prompt") or item.get("query") or item.get("instruction") or "").strip()
+            if data_relative_path and prompt:
+                actions.append(
+                    {
+                        "type": "create_data_figure",
+                        "reason": reason,
+                        "data_relative_path": data_relative_path,
+                        "prompt": prompt,
+                    }
+                )
+            continue
+
+        if action_type in {"create_brief", "brief"}:
+            prompt = str(item.get("prompt") or item.get("query") or item.get("instruction") or "").strip()
+            if prompt:
+                actions.append(
+                    {
+                        "type": "create_brief",
+                        "reason": reason,
+                        "prompt": prompt,
+                        "format": str(item.get("format") or item.get("target_format") or "summary").strip() or "summary",
+                        "scope_heading": str(item.get("scope_heading") or item.get("section_title") or "").strip(),
+                    }
+                )
+            continue
+
+    return actions
+
+
 def normalize_suggestion(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         payload = {"rewritten_text": str(payload).strip()}
@@ -86,6 +243,69 @@ def parse_json_payload(text: str) -> dict[str, Any]:
     return normalize_suggestion(parsed)
 
 
+def normalize_editor_chat(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {"content": str(payload).strip()}
+    suggestion = normalize_suggestion(payload)
+    content = str(payload.get("content", "")).strip()
+    operations = normalize_editor_operations(payload.get("operations"))
+    selected_text = str(
+        payload.get("selected_text")
+        or payload.get("target_text")
+        or payload.get("original_text")
+        or "",
+    ).strip()
+    if not content:
+        if suggestion["rewritten_text"]:
+            content = "已根据当前上下文给出一版可直接应用的改写。"
+        else:
+            content = suggestion["rationale"] or "已完成这轮写作协作。"
+    return {
+        "content": content,
+        "selected_text": selected_text,
+        "rewritten_text": suggestion["rewritten_text"],
+        "operations": operations,
+        "rationale": suggestion["rationale"],
+        "process_summary": suggestion["process_summary"],
+        "risks": suggestion["risks"],
+        "citation_or_data_notes": suggestion["citation_or_data_notes"],
+        "confidence": suggestion["confidence"],
+    }
+
+
+def parse_editor_chat_json(text: str) -> dict[str, Any]:
+    parsed = extract_json_value(
+        text,
+        fallback={
+            "content": text.strip(),
+            "rewritten_text": "",
+            "operations": [],
+            "rationale": "AI 返回了非结构化内容，已作为会话回复展示。",
+            "process_summary": [],
+            "risks": [],
+            "citation_or_data_notes": [],
+            "confidence": "medium",
+        },
+    )
+    return normalize_editor_chat(parsed)
+
+
+def parse_editor_tool_plan_json(text: str) -> dict[str, Any]:
+    parsed = extract_json_value(
+        text,
+        fallback={
+            "tool_actions": [],
+            "reason": "",
+        },
+    )
+    if not isinstance(parsed, dict):
+        parsed = {}
+    return {
+        "tool_actions": normalize_editor_tool_actions(parsed.get("tool_actions")),
+        "reason": str(parsed.get("reason", "")).strip(),
+    }
+
+
 def normalize_literature_analysis(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         payload = {}
@@ -99,6 +319,8 @@ def normalize_literature_analysis(payload: Any) -> dict[str, Any]:
         "relevance": str(payload.get("relevance", "")).strip(),
         "structure_suggestions": normalize_text_list(payload.get("structure_suggestions")),
         "citation_uses": normalize_text_list(payload.get("citation_uses")),
+        "literature_review": str(payload.get("literature_review", "")).strip(),
+        "discussion_points": normalize_text_list(payload.get("discussion_points")),
         "import_recommendation": str(payload.get("import_recommendation", "")).strip(),
     }
 
@@ -133,16 +355,68 @@ def suggestion_instructions(settings: dict[str, Any]) -> str:
     )
 
 
+def editor_chat_instructions(settings: dict[str, Any]) -> str:
+    return (
+        build_persona_block(settings)
+        + (
+        "You are a persistent academic writing collaborator working inside a manuscript editor chat. "
+        "The user may ask you to revise the currently selected passage, explain weaknesses, or iteratively refine an earlier draft. "
+        "Sometimes no passage is selected; in that case, identify the single best concrete passage from the provided manuscript context that matches the user's request. "
+        "Use only the provided selected passage, manuscript excerpt, manuscript section snapshots, project asset inventory, outline, local-source excerpts, recent editor turns, executed tool results, and project memory. "
+        "Do not invent citations, data, or findings; flag uncertainty clearly. "
+        "Return JSON only with these fields: content, selected_text, rewritten_text, operations, rationale, process_summary, risks, citation_or_data_notes, confidence. "
+        "`content` must be a short chat-ready reply in 1-3 sentences. "
+        "Set `rewritten_text` to a full replacement passage only when the user is asking for a concrete rewrite or revision; otherwise return an empty string. "
+        "Whenever `rewritten_text` is non-empty, `selected_text` must also be non-empty and must be the exact original passage to replace from the manuscript context. "
+        "Choose a sufficiently distinctive multi-sentence or full-paragraph `selected_text` whenever possible, so it can be matched safely in the manuscript. "
+        "If no text is selected by the user, you may choose the target passage yourself, but still return it exactly in `selected_text`. "
+        "If the manuscript context is insufficient to identify one exact passage safely, leave both `selected_text` and `rewritten_text` empty and explain what is missing in `content` or `rationale`. "
+        "Use `operations` when the request needs whole-document edits or multiple coordinated actions. "
+        "Allowed operation types are: "
+        "(1) `replace_text` with `target_text` and `replacement`; "
+        "(2) `insert_under_heading` with `section_title` and `content`; "
+        "(3) `insert_figure` with `section_title`, `figure_relative_path`, `figure_title`, `figure_caption`, optional `figure_alt_text`, and optional `introduction`. "
+        "Use `figure_relative_path` exactly as provided in the project asset inventory. "
+        "Prefer `operations` for global edits, literature-review insertions, and figure placements. "
+        "Keep `operations` empty when the user only wants explanation or critique. "
+        "`process_summary` must be an array of 2-4 short bullet strings that explain the visible revision process at a high level. "
+        "Do not reveal hidden chain-of-thought or internal reasoning tokens."
+        )
+    )
+
+
+def editor_tool_planner_instructions(settings: dict[str, Any]) -> str:
+    return (
+        build_persona_block(settings)
+        + (
+        "You are planning whether an academic manuscript editor should call internal tools before drafting an edit. "
+        "Use only the provided manuscript context, project asset inventory, local-source excerpts, and recent turns. "
+        "Return JSON only with these fields: tool_actions, reason. "
+        "`tool_actions` must be an array, possibly empty. "
+        "Only request a tool when it is clearly necessary to satisfy the user's request better than direct editing alone. "
+        "Allowed tool actions are: "
+        "(1) `import_literature` with `query` and optional `download_original`; use this when the user wants the editor to bring in a paper/article and use it in the manuscript. "
+        "(2) `create_data_figure` with `data_relative_path` and `prompt`; use this when the user wants a new figure generated from an existing project dataset. "
+        "(3) `create_brief` with `prompt`, optional `format`, and optional `scope_heading`; use this when the user wants a structured brief or summary artifact first. "
+        "Never invent file paths. `data_relative_path` must exactly match one of the project data files in the provided asset inventory. "
+        "Keep `tool_actions` empty when direct rewriting or insertion is enough without tools. "
+        "Prefer at most 2 tool actions in one response."
+        )
+    )
+
+
 def literature_instructions(settings: dict[str, Any]) -> str:
     return (
         build_persona_block(settings)
         + (
         "You are helping a researcher evaluate a candidate literature source. "
-        "Use only the provided bibliographic metadata, abstract, excerpt, and the paper outline. "
-        "Return JSON only with these fields: title, authors, year, venue, summary, content, relevance, structure_suggestions, citation_uses, import_recommendation. "
+        "Use only the provided bibliographic metadata, abstract, excerpt, imported source excerpts, and the paper outline. "
+        "Return JSON only with these fields: title, authors, year, venue, summary, content, relevance, structure_suggestions, citation_uses, literature_review, discussion_points, import_recommendation. "
         "`content` must be 1-3 sentences of plain text summarising the source and its relevance — used for display in a chat interface. "
         "`structure_suggestions` should be 2-5 concrete suggestions linked to the current outline. "
-        "`citation_uses` should be 1-4 practical ways to use the source in a literature review or framing section."
+        "`citation_uses` should be 1-4 practical ways to use the source in a literature review or framing section. "
+        "`literature_review` should be a polished paragraph the user could adapt into a literature review when the context is sufficient; otherwise return an empty string. "
+        "`discussion_points` should be 2-4 concrete follow-up angles the user can discuss with the AI about the article content."
         )
     )
 

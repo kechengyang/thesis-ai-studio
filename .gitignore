@@ -1,8 +1,37 @@
+# Build output
+build/
+dist/
+electron/
+
+# Local environment
 .env
 .runtime/
 backend/.venv/
 frontend/node_modules/
 frontend/dist/
+frontend/.vite/
+docker-compose.override.yml
+compose.override.yml
+
+# OS / editor noise
+.DS_Store
+AGENTS.md
+.superpowers/
+docs/superpowers/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.log
+
+# Local test workspace
+higher-education/
+
+# Legacy workspace generated content
 workspace/outputs/
 workspace/sources/*
 !workspace/sources/.gitkeep

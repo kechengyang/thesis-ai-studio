@@ -17,6 +17,20 @@ class DocumentCreate(BaseModel):
     filename: str
 
 
+class ProjectFileRename(BaseModel):
+    relative_path: str
+    new_name: str
+
+
+class ProjectFileMove(BaseModel):
+    relative_path: str
+    target_category: str
+
+
+class ProjectFileDelete(BaseModel):
+    relative_path: str
+
+
 class SettingsUpdate(BaseModel):
     api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
@@ -37,13 +51,14 @@ class SuggestRequest(BaseModel):
 
 
 class ApplyRequest(BaseModel):
-    original_segment: str
-    replacement: str
+    original_segment: Optional[str] = None
+    replacement: str = ""
+    operations: list[dict[str, Any]] = []
     suggestion_id: Optional[str] = None
 
 
 class RejectRequest(BaseModel):
-    original_segment: str
+    original_segment: Optional[str] = None
     suggestion: Optional[dict[str, Any]] = None
     suggestion_id: Optional[str] = None
 

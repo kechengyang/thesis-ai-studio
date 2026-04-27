@@ -159,8 +159,10 @@ def data_analysis_code_instructions(settings: dict[str, Any]) -> str:
             "(5) Keep the figure readable: limit categories shown, rotate long labels, add a clear title. "
             "Return JSON only with these fields: "
             "analysis_title, figure_title, figure_caption, figure_alt_text, "
-            "suggested_section, summary, content, key_points, insert_paragraph, code. "
+            "suggested_section, summary, content, data_result, supporting_data, key_points, insert_paragraph, code. "
             "`content` must be 1-3 sentences of plain text summarising what was generated — used for display in a chat interface."
+            "`data_result` must summarise the underlying analytical finding in 1-3 sentences before mentioning chart styling. "
+            "`supporting_data` should be 2-6 concrete numeric or categorical facts visible in the plotted result."
         )
     )
 
@@ -197,10 +199,12 @@ def normalize_analysis_metadata(
     prompt: str,
     outline: list[dict[str, Any]],
     figure_relative_path: str,
+    profile: dict[str, Any],
 ) -> dict[str, Any]:
     title = str(payload.get("analysis_title") or prompt or "Data Analysis").strip()
     summary = str(payload.get("summary") or "").strip()
     content = str(payload.get("content") or summary).strip()
+    preview_columns = [column.get("name", "") for column in profile.get("columns", [])[:6] if column.get("name")]
     return {
         "analysis_title": title,
         "figure_title": str(payload.get("figure_title") or title).strip(),
@@ -209,9 +213,17 @@ def normalize_analysis_metadata(
         "suggested_section": select_outline_section(outline, payload.get("suggested_section")),
         "summary": summary,
         "content": content,
+        "data_result": str(payload.get("data_result") or content or summary).strip(),
+        "supporting_data": normalize_text_list(payload.get("supporting_data") or payload.get("key_points")),
         "key_points": normalize_text_list(payload.get("key_points")),
         "insert_paragraph": str(payload.get("insert_paragraph") or "").strip(),
         "figure_relative_path": figure_relative_path,
+        "dataset_snapshot": {
+            "row_count": int(profile.get("row_count") or 0),
+            "column_count": int(profile.get("column_count") or 0),
+            "preview_columns": preview_columns,
+            "preview_rows": list(profile.get("preview_rows") or [])[:5],
+        },
     }
 
 
@@ -283,7 +295,7 @@ def run_data_analysis_skill(
             detail=f"图表生成失败（已重试 {MAX_CODE_RETRIES} 次）：{last_error}",
         )
 
-    meta = normalize_analysis_metadata(plan, prompt, outline, figure_relative_path)
+    meta = normalize_analysis_metadata(plan, prompt, outline, figure_relative_path, profile)
     record_relative_path = ensure_unique_relative_path(project, "outputs/analysis", figure_stem, ".json")
     record_payload = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -321,6 +333,7 @@ def chat_data_turn(
     if dataframe.empty:
         raise HTTPException(status_code=400, detail="这个数据文件是空的，无法进行分析。")
 
+    profile = dataframe_profile(dataframe)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     figure_stem = slugify(f"{data_path.stem}-chat-{timestamp}", fallback="analysis")
     figure_relative_path = ensure_unique_relative_path(project, "figures", figure_stem, ".png")
@@ -361,7 +374,7 @@ def chat_data_turn(
             detail=f"图表生成失败（已重试 {MAX_CODE_RETRIES} 次）：{last_error}",
         )
 
-    meta = normalize_analysis_metadata(plan, "", outline, figure_relative_path)
+    meta = normalize_analysis_metadata(plan, "", outline, figure_relative_path, profile)
     record_relative_path = ensure_unique_relative_path(project, "outputs/analysis", figure_stem, ".json")
     record_payload = {
         "created_at": datetime.now().isoformat(timespec="seconds"),

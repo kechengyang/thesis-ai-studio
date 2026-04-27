@@ -59,6 +59,16 @@ function jsonOptions(method, payload) {
   };
 }
 
+function withQuery(path, params = {}) {
+  const search = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === '') return;
+    search.set(key, String(value));
+  });
+  const query = search.toString();
+  return query ? `${path}?${query}` : path;
+}
+
 export async function request(path, options = {}) {
   try {
     const response = await fetchWithRetry(`${API}${path}`, options);
@@ -81,6 +91,15 @@ export const studioApi = {
   },
   getDocument() {
     return request('/document');
+  },
+  renameProjectFile(relativePath, newName) {
+    return request('/project/file/rename', jsonOptions('POST', { relative_path: relativePath, new_name: newName }));
+  },
+  moveProjectFile(relativePath, targetCategory) {
+    return request('/project/file/move', jsonOptions('POST', { relative_path: relativePath, target_category: targetCategory }));
+  },
+  deleteProjectFile(relativePath) {
+    return request('/project/file/delete', jsonOptions('POST', { relative_path: relativePath }));
   },
   openDocument(relativePath) {
     return request('/document/open', jsonOptions('POST', { relative_path: relativePath }));
@@ -136,10 +155,11 @@ export const studioApi = {
       download_original: downloadOriginal,
     }));
   },
-  applySuggestion(originalSegment, replacement, suggestionId) {
+  applySuggestion(originalSegment, replacement, suggestionId, operations = []) {
     return request('/ai/apply', jsonOptions('POST', {
-      original_segment: originalSegment,
-      replacement,
+      original_segment: originalSegment || undefined,
+      replacement: replacement || '',
+      operations,
       suggestion_id: suggestionId || undefined,
     }));
   },
@@ -159,13 +179,13 @@ export const studioApi = {
 };
 
 export const chatApi = {
-  load(tool) {
-    return request(`/chat/${tool}`);
+  load(tool, options = {}) {
+    return request(withQuery(`/chat/${tool}`, { chat_key: options.chatKey || '' }));
   },
   send(tool, message, history, context = {}) {
     return request(`/chat/${tool}`, jsonOptions('POST', { message, history, context }));
   },
-  clear(tool) {
-    return request(`/chat/${tool}`, { method: 'DELETE' });
+  clear(tool, options = {}) {
+    return request(withQuery(`/chat/${tool}`, { chat_key: options.chatKey || '' }), { method: 'DELETE' });
   },
 };

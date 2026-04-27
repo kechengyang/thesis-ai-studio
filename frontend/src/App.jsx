@@ -1,34 +1,35 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   BookOpen,
-  Bot,
   ChevronDown,
-  CircleAlert,
   Database,
   Download,
   Eye,
   FileText,
   Folder,
   FolderOpen,
+  GripVertical,
   Image,
-  Loader2,
+  Pencil,
   Plus,
   RefreshCw,
   Save,
   Settings,
   Sparkles,
+  Trash2,
   Upload,
 } from 'lucide-react';
 
-import { API, request, studioApi } from './api';
+import { chatApi, request, studioApi } from './api';
 import { AnalysisWorkspace } from './components/AnalysisWorkspace';
+import { ChatPanel } from './components/ChatPanel';
 import { FilePreview } from './components/FilePreview';
 import { MemoryPanel } from './components/MemoryPanel';
 import { NewManuscriptModal } from './components/NewManuscriptModal';
-import { NewProjectModal } from './components/NewProjectModal';
 import { QmdPreview } from './components/QmdPreview';
 import { SettingsModal } from './components/SettingsModal';
 import { SuggestionPanel } from './components/SuggestionPanel';
+import { WorkspaceRootModal } from './components/WorkspaceRootModal';
 
 function estimateWordCount(value) {
   const cleaned = String(value || '')
@@ -84,18 +85,78 @@ function categoryIcon(category) {
   return <Folder size={15} />;
 }
 
+function hasConfiguredWorkspace(projectData) {
+  if (!projectData) return false;
+  if (typeof projectData.workspace_configured === 'boolean') {
+    return projectData.workspace_configured;
+  }
+  return Boolean(projectData.workspace || projectData.active_project || projectData.active_manuscript);
+}
+
+function latestSelectedTextFromMessages(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    const selected = message?.result?.selected_text || message?.context?.selected_text || '';
+    if (String(selected).trim()) {
+      return String(selected).trim();
+    }
+  }
+  return '';
+}
+
+function describeEditorChatError(error) {
+  const message = String(error?.message || '').trim();
+  if (message === 'Not Found') {
+    return 'AI 协作会话接口未加载到当前后端。请重启应用或后端服务后再试。';
+  }
+  return message || 'AI 协作请求失败。';
+}
+
+function readStoredPanelWidth(key, fallback) {
+  if (typeof window === 'undefined') return fallback;
+  const raw = window.localStorage.getItem(key);
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 340 ? value : fallback;
+}
+
+function summarizeEditorOperations(operations) {
+  if (!Array.isArray(operations) || operations.length === 0) return '';
+  return operations.slice(0, 3).map((operation) => {
+    if (operation.type === 'replace_text') {
+      return `替换：${String(operation.target_text || '').trim().slice(0, 36)}`;
+    }
+    if (operation.type === 'insert_under_heading') {
+      return `插入到 ${operation.section_title || '文末'}`;
+    }
+    if (operation.type === 'insert_figure') {
+      return `插图：${operation.figure_relative_path || ''}`;
+    }
+    return operation.type || 'edit';
+  }).join(' / ');
+}
+
+function hasEditorActions(result) {
+  if (!result) return false;
+  if (result.rewritten_text && result.selected_text) return true;
+  return Array.isArray(result.operations) && result.operations.length > 0;
+}
+
+function hasEditorToolResults(result) {
+  return Array.isArray(result?.tool_results) && result.tool_results.length > 0;
+}
+
 export default function App() {
   const editorRef = useRef(null);
   const previewRef = useRef(null);
   const sourceImportRef = useRef(null);
   const fileMenuRef = useRef(null);
+  const manuscriptResizeRef = useRef({ active: false, startX: 0, startWidth: 0 });
   const [project, setProject] = useState(null);
   const [content, setContent] = useState('');
   const [savedContent, setSavedContent] = useState('');
   const [selectedText, setSelectedText] = useState('');
-  const [instruction, setInstruction] = useState('Revise the selected passage into clear, polished academic English while preserving the meaning.');
-  const [suggestion, setSuggestion] = useState(null);
-  const [suggestionId, setSuggestionId] = useState('');
+  const [editorNeedsFreshSelection, setEditorNeedsFreshSelection] = useState(false);
+  const [editorMessages, setEditorMessages] = useState([]);
   const [settings, setSettings] = useState({ provider: 'openai', model: 'gpt-5.5', reasoning: 'medium', instruction: '' });
   const [openaiApiKey, setOpenaiApiKey] = useState('');
   const [deepseekApiKey, setDeepseekApiKey] = useState('');
@@ -105,26 +166,34 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
   const [showCreateManuscript, setShowCreateManuscript] = useState(false);
-  const [showCreateProject, setShowCreateProject] = useState(false);
+  const [showWorkspaceRootModal, setShowWorkspaceRootModal] = useState(false);
   const [workspaceMode, setWorkspaceMode] = useState('manuscript');
-  const [selectedProjectId, setSelectedProjectId] = useState('');
   const [providerCatalog, setProviderCatalog] = useState({ current_provider: 'openai', providers: [] });
   const [activeOutlineId, setActiveOutlineId] = useState('');
   const [previewFile, setPreviewFile] = useState(null);
+  const [manuscriptAiWidth, setManuscriptAiWidth] = useState(() => readStoredPanelWidth('tas.manuscriptAiWidth', 500));
+  const [draggedFile, setDraggedFile] = useState(null);
+  const [dragOverCategory, setDragOverCategory] = useState('');
 
   async function refreshWorkspace() {
-    const [projectData, documentData, providerData] = await Promise.all([
+    const [projectData, providerData] = await Promise.all([
       studioApi.getProject(),
-      studioApi.getDocument(),
       studioApi.getProviders(),
     ]);
     setProject(projectData);
     setSettings(projectData.settings);
-    setContent(documentData.content);
-    setSavedContent(documentData.content);
-    setSelectedProjectId(projectData.active_project);
     setProviderCatalog(providerData);
     setDeepseekBaseUrl(projectData.settings.deepseek_base_url || '');
+    if (!hasConfiguredWorkspace(projectData)) {
+      resetWorkspaceTransientState();
+      setContent('');
+      setSavedContent('');
+      setActiveOutlineId('');
+      return;
+    }
+    const documentData = await studioApi.getDocument();
+    setContent(documentData.content);
+    setSavedContent(documentData.content);
     const nextOutline = splitSections(documentData.content);
     setActiveOutlineId((current) => (
       current && nextOutline.some((item) => item.anchorId === current)
@@ -138,13 +207,71 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!project) return;
+    if (!hasConfiguredWorkspace(project)) {
+      setShowWorkspaceRootModal(true);
+      if (project.workspace_error) {
+        setMessage(project.workspace_error);
+      }
+    }
+  }, [project]);
+
+  useEffect(() => {
     const provider = providerCatalog.providers?.find((item) => item.id === (settings.provider || 'openai'));
     if (!provider?.models?.length) return;
     if (provider.models.some((item) => item.id === settings.model)) return;
     setSettings((current) => ({ ...current, model: provider.models[0].id }));
   }, [providerCatalog, settings.provider, settings.model]);
 
+  useEffect(() => {
+    const activeWorkspace = project?.workspace || '';
+    const activeManuscriptPath = project?.active_manuscript || '';
+    if (!activeWorkspace || !activeManuscriptPath) {
+      setEditorMessages([]);
+      return;
+    }
+    let cancelled = false;
+    chatApi.load('editor', { chatKey: activeManuscriptPath })
+      .then((data) => {
+        if (!cancelled) {
+          setEditorMessages(data.history || []);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setMessage(describeEditorChatError(error));
+          setEditorMessages([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [project?.workspace, project?.active_manuscript]);
+
+  useEffect(() => {
+    function onMouseMove(event) {
+      if (!manuscriptResizeRef.current.active) return;
+      const delta = manuscriptResizeRef.current.startX - event.clientX;
+      setManuscriptAiWidth(Math.max(360, Math.min(760, manuscriptResizeRef.current.startWidth + delta)));
+    }
+    function onMouseUp() {
+      manuscriptResizeRef.current.active = false;
+    }
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    window.localStorage.setItem('tas.manuscriptAiWidth', String(manuscriptAiWidth));
+  }, [manuscriptAiWidth]);
+
   async function refreshMemory() {
+    if (!hasConfiguredWorkspace(project)) return;
     const memory = await studioApi.getMemory();
     setProject((current) => (current ? { ...current, memory } : current));
   }
@@ -155,10 +282,40 @@ export default function App() {
     }
   }
 
-  function captureSelection() {
+  function startManuscriptResize(event) {
+    manuscriptResizeRef.current = {
+      active: true,
+      startX: event.clientX,
+      startWidth: manuscriptAiWidth,
+    };
+    event.preventDefault();
+  }
+
+  function resetWorkspaceTransientState() {
+    setShowPreview(false);
+    setSelectedText('');
+    setEditorNeedsFreshSelection(false);
+    setEditorMessages([]);
+    setPreviewFile(null);
+  }
+
+  function readEditorSelection() {
     const editor = editorRef.current;
-    if (!editor) return;
-    setSelectedText(editor.value.slice(editor.selectionStart, editor.selectionEnd));
+    if (!editor) return '';
+    return editor.value.slice(editor.selectionStart, editor.selectionEnd);
+  }
+
+  function resolveEditorTargetText() {
+    if (editorNeedsFreshSelection) return '';
+    return readEditorSelection() || selectedText || latestSelectedTextFromMessages(editorMessages);
+  }
+
+  function captureSelection() {
+    const nextSelection = readEditorSelection();
+    setSelectedText(nextSelection);
+    if (nextSelection.trim()) {
+      setEditorNeedsFreshSelection(false);
+    }
   }
 
   function jumpToEditorPosition(position) {
@@ -205,6 +362,7 @@ export default function App() {
   }
 
   async function saveCurrentIfDirty() {
+    if (!hasConfiguredWorkspace(project)) return false;
     if (content === savedContent) return false;
     await persistCurrentDocument(content);
     return true;
@@ -243,18 +401,16 @@ export default function App() {
     }
   }
 
-  async function createProject(name) {
-    setBusy('create');
+  async function updateWorkspaceRoot(path) {
+    setBusy('workspace-root');
     try {
       await saveCurrentIfDirty();
-      await studioApi.createProject(name || 'Thesis Draft');
-      setShowPreview(false);
-      setSuggestion(null);
-      setSuggestionId('');
-      setSelectedText('');
-      setShowCreateProject(false);
+      const nextProject = await studioApi.updateWorkspaceRoot(path);
+      resetWorkspaceTransientState();
+      setShowWorkspaceRootModal(false);
+      setProject(nextProject);
       await refreshWorkspace();
-      setMessage('新论文项目已创建。');
+      setMessage('Workspace 已载入，并已写入本地状态。');
     } catch (error) {
       setMessage(error.message);
     } finally {
@@ -262,18 +418,18 @@ export default function App() {
     }
   }
 
-  async function openProject(projectId = selectedProjectId) {
-    if (!projectId) return;
-    setBusy('open');
+  async function chooseWorkspaceRoot() {
+    setBusy('workspace-root-choose');
     try {
       await saveCurrentIfDirty();
-      await studioApi.openProject(projectId);
-      setShowPreview(false);
-      setSuggestion(null);
-      setSuggestionId('');
-      setSelectedText('');
+      const data = await studioApi.chooseWorkspaceRoot();
+      if (data.cancelled) {
+        setMessage('已取消选择 Workspace 文件夹。');
+        return;
+      }
+      resetWorkspaceTransientState();
       await refreshWorkspace();
-      setMessage('项目已打开。');
+      setMessage('Workspace 已载入，并已写入本地状态。');
     } catch (error) {
       setMessage(error.message);
     } finally {
@@ -300,9 +456,9 @@ export default function App() {
       const autoSaved = await saveCurrentIfDirty();
       await studioApi.openDocument(relativePath);
       setShowPreview(false);
-      setSuggestion(null);
-      setSuggestionId('');
       setSelectedText('');
+      setEditorNeedsFreshSelection(false);
+      setEditorMessages([]);
       await refreshWorkspace();
       setMessage(autoSaved ? `已自动保存当前文稿，并切换到 ${relativePath}。` : `已切换到 ${relativePath}。`);
     } catch (error) {
@@ -319,9 +475,9 @@ export default function App() {
       await saveCurrentIfDirty();
       const data = await studioApi.createDocument(filename);
       setShowPreview(false);
-      setSuggestion(null);
-      setSuggestionId('');
       setSelectedText('');
+      setEditorNeedsFreshSelection(false);
+      setEditorMessages([]);
       setShowCreateManuscript(false);
       await refreshWorkspace();
       setMessage(`已创建并切换到 ${data.filename}。`);
@@ -329,6 +485,92 @@ export default function App() {
       setMessage(error.message);
     } finally {
       setBusy('');
+    }
+  }
+
+  function clearFileDragState() {
+    setDraggedFile(null);
+    setDragOverCategory('');
+  }
+
+  function canDropIntoCategory(category) {
+    if (isBusy || !draggedFile) return false;
+    return Array.isArray(draggedFile.move_targets) && draggedFile.move_targets.includes(category);
+  }
+
+  function startFileDrag(event, file) {
+    if (!file?.can_move || isBusy) return;
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', file.relative_path);
+    setDraggedFile(file);
+    setDragOverCategory('');
+  }
+
+  async function renameWorkspaceFile(file) {
+    if (!file?.can_rename || isBusy) return;
+    const nextName = window.prompt('输入新的文件名', file.name);
+    if (nextName === null) return;
+    const trimmed = nextName.trim();
+    if (!trimmed || trimmed === file.name) return;
+    setBusy('file-rename');
+    try {
+      if (file.relative_path === activeManuscript) {
+        await saveCurrentIfDirty();
+      }
+      const data = await studioApi.renameProjectFile(file.relative_path, trimmed);
+      if (previewFile?.relative_path === file.relative_path) {
+        setPreviewFile((current) => (current ? { ...current, name: data.filename, relative_path: data.relative_path } : current));
+      }
+      await refreshWorkspace();
+      setMessage(`已将 ${file.name} 重命名为 ${data.filename}。`);
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function moveWorkspaceFile(file, targetCategory) {
+    if (!file?.can_move || isBusy || !file.move_targets?.includes(targetCategory)) return;
+    setBusy('file-move');
+    try {
+      const data = await studioApi.moveProjectFile(file.relative_path, targetCategory);
+      if (previewFile?.relative_path === file.relative_path) {
+        setPreviewFile((current) => (current ? { ...current, name: data.filename, relative_path: data.relative_path } : current));
+      }
+      await refreshWorkspace();
+      setMessage(`已将 ${file.name} 移动到 ${targetCategory}。`);
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setBusy('');
+      clearFileDragState();
+    }
+  }
+
+  async function deleteWorkspaceFile(file) {
+    if (!file?.can_delete || isBusy) return;
+    const confirmed = window.confirm(`确认删除 ${file.name}？此操作不会进入回收站。`);
+    if (!confirmed) return;
+    setBusy('file-delete');
+    try {
+      if (file.relative_path === activeManuscript) {
+        await saveCurrentIfDirty();
+        setSelectedText('');
+        setEditorNeedsFreshSelection(false);
+        setEditorMessages([]);
+      }
+      await studioApi.deleteProjectFile(file.relative_path);
+      if (previewFile?.relative_path === file.relative_path) {
+        setPreviewFile(null);
+      }
+      await refreshWorkspace();
+      setMessage(`已删除 ${file.name}。`);
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setBusy('');
+      clearFileDragState();
     }
   }
 
@@ -350,74 +592,85 @@ export default function App() {
     }
   }
 
-  async function askAi() {
-    captureSelection();
-    const currentSelection = selectedText || (() => {
-      const editor = editorRef.current;
-      return editor ? editor.value.slice(editor.selectionStart, editor.selectionEnd) : '';
-    })();
-    setBusy('ai');
-    setSuggestion(null);
-    setSuggestionId('');
+  async function sendEditorMessage(messageText) {
+    const currentSelection = resolveEditorTargetText().trim();
+    const context = {
+      chat_key: activeManuscript,
+      active_manuscript: activeManuscript,
+      selected_text: currentSelection,
+      document: content,
+    };
+    const optimisticUser = {
+      id: `optimistic-${Date.now()}`,
+      role: 'user',
+      timestamp: new Date().toISOString(),
+      content: messageText,
+      context,
+    };
+    setBusy('editor-chat');
+    setEditorMessages((current) => [...current, optimisticUser]);
     try {
-      const response = await fetch(`${API}/ai/suggest/stream`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ instruction, selected_text: currentSelection, document: content }),
-      });
-      if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.detail || 'AI 建议生成失败。');
-      }
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let rawText = '';
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const events = buffer.split('\n\n');
-        buffer = events.pop() || '';
-        for (const event of events) {
-          const line = event.split('\n').find((item) => item.startsWith('data: '));
-          if (!line) continue;
-          const payload = JSON.parse(line.slice(6));
-          if (payload.type === 'delta') {
-            rawText += payload.text;
-            setMessage(`AI 正在生成建议... ${rawText.length} 字`);
-          }
-          if (payload.type === 'final') {
-            setSuggestion({ ...payload.suggestion, trace: payload.trace || null });
-            setSuggestionId(payload.suggestion_id || '');
-          }
-          if (payload.type === 'error') {
-            throw new Error(payload.message);
-          }
-        }
-      }
-      setSelectedText(currentSelection);
+      const history = editorMessages;
+      const data = await chatApi.send('editor', messageText, history, context);
+      const assistantMessage = data.message;
+      setEditorMessages((current) => [
+        ...current.filter((item) => item.id !== optimisticUser.id),
+        optimisticUser,
+        assistantMessage,
+      ]);
+      setSelectedText(String(assistantMessage.result?.selected_text || currentSelection || '').trim());
+      setEditorNeedsFreshSelection(false);
       await refreshMemory();
-      setMessage('AI 建议已生成，确认后才会写入正文。');
+      if (hasEditorToolResults(assistantMessage.result)) {
+        await refreshWorkspace();
+      }
+      setMessage(
+        hasEditorActions(assistantMessage.result)
+          ? `AI 已规划可应用的编辑动作${assistantMessage.result?.operations?.length ? `（${assistantMessage.result.operations.length} 项）` : ''}。`
+          : hasEditorToolResults(assistantMessage.result)
+            ? `AI 已执行 ${assistantMessage.result.tool_results.length} 个工具步骤。`
+          : 'AI 回复已生成。',
+      );
     } catch (error) {
-      setMessage(error.message);
+      setEditorMessages((current) => current.filter((item) => item.id !== optimisticUser.id));
+      setMessage(describeEditorChatError(error));
     } finally {
       setBusy('');
     }
   }
 
-  async function applySuggestion() {
-    if (!suggestion?.rewritten_text) return;
+  async function clearEditorConversation() {
+    if (!activeManuscript) return;
+    setBusy('editor-chat-clear');
+    try {
+      await chatApi.clear('editor', { chatKey: activeManuscript });
+      setEditorMessages([]);
+      setSelectedText('');
+      setEditorNeedsFreshSelection(false);
+      setMessage('已清空当前文稿的 AI 会话。');
+    } catch (error) {
+      setMessage(describeEditorChatError(error));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function applyEditorSuggestion(chatMessage) {
+    const result = chatMessage?.result || {};
+    const operations = Array.isArray(result.operations) ? result.operations : [];
+    if (!hasEditorActions(result)) {
+      setMessage('这条建议没有可执行的编辑动作，暂时不能直接应用。');
+      return;
+    }
     setBusy('apply');
     try {
-      const data = await studioApi.applySuggestion(selectedText, suggestion.rewritten_text, suggestionId);
+      const data = await studioApi.applySuggestion(result.selected_text, result.rewritten_text, result.suggestion_id, operations);
       setContent(data.content);
       setSavedContent(data.content);
-      setSuggestion(null);
-      setSuggestionId('');
       setSelectedText('');
+      setEditorNeedsFreshSelection(true);
       await refreshMemory();
-      setMessage('修改已应用到正文。');
+      setMessage(operations.length > 0 ? `已将 ${operations.length} 个编辑动作应用到正文。` : '修改已应用到正文。');
     } catch (error) {
       setMessage(error.message);
     } finally {
@@ -425,13 +678,17 @@ export default function App() {
     }
   }
 
-  async function rejectSuggestion() {
-    if (!suggestion) return;
+  async function rejectEditorSuggestion(chatMessage) {
+    const result = chatMessage?.result || {};
+    if (!hasEditorActions(result)) {
+      setMessage('这条建议没有可追踪的编辑动作。');
+      return;
+    }
     setBusy('reject');
     try {
-      await studioApi.rejectSuggestion(selectedText, suggestion, suggestionId);
-      setSuggestion(null);
-      setSuggestionId('');
+      await studioApi.rejectSuggestion(result.selected_text || summarizeEditorOperations(result.operations), result, result.suggestion_id);
+      setSelectedText('');
+      setEditorNeedsFreshSelection(true);
       await refreshMemory();
       setMessage('已拒绝建议，并记录到项目 memory。');
     } catch (error) {
@@ -486,6 +743,21 @@ export default function App() {
     setSettings((current) => ({ ...current, provider: providerId, model: nextModel }));
   }
 
+  function renderEditorResult(message) {
+    if (!message?.result) return null;
+    const suggestion = message.result;
+    if (!suggestion.rewritten_text && !(suggestion.operations?.length > 0) && !(suggestion.tool_results?.length > 0) && !suggestion.rationale && !suggestion.trace) return null;
+    return (
+      <SuggestionPanel
+        compact={true}
+        isBusy={isBusy}
+        onApply={hasEditorActions(suggestion) ? () => applyEditorSuggestion(message) : undefined}
+        onReject={hasEditorActions(suggestion) ? () => rejectEditorSuggestion(message) : undefined}
+        suggestion={suggestion}
+      />
+    );
+  }
+
   const outline = splitSections(content);
   const sources = project?.sources || [];
   const files = project?.files || [];
@@ -493,15 +765,21 @@ export default function App() {
   const projectFigureFiles = (files.find((g) => g.category === 'Figures')?.files || []).filter((f) => ['png', 'jpg', 'jpeg', 'svg', 'webp'].includes(f.extension));
   const manuscriptWordCount = estimateWordCount(content);
   const manuscripts = project?.manuscripts || [];
-  const projects = project?.projects || [];
   const memory = project?.memory || { conversation_count: 0, change_count: 0, recent_conversations: [], recent_changes: [] };
   const isBusy = Boolean(busy);
+  const workspaceConfigured = hasConfiguredWorkspace(project);
+  const workspaceRootLabel = project?.projects_root || project?.workspace_suggestion || '请选择 Workspace 文件夹';
+  const workspaceDisplayName = project?.active_project || '未选择 Workspace';
   const providers = providerCatalog.providers || [];
   const selectedProvider = providers.find((item) => item.id === (settings.provider || 'openai'));
   const modelOptions = selectedProvider?.models || [];
   const activeManuscript = project?.active_manuscript || manuscripts[0]?.relative_path || '';
   const activeManuscriptName = activeManuscript ? activeManuscript.split('/').pop() : '';
   const hasUnsavedChanges = content !== savedContent;
+  const liveEditorSelection = readEditorSelection().trim();
+  const editorTargetText = editorNeedsFreshSelection ? '' : (liveEditorSelection || selectedText || latestSelectedTextFromMessages(editorMessages));
+  const editorSelectionLabel = liveEditorSelection ? '当前选中' : editorTargetText ? '会话目标' : '当前文稿';
+  const editorChatBusy = ['editor-chat', 'editor-chat-clear', 'apply', 'reject'].includes(busy);
 
   return (
     <main className="app-shell">
@@ -509,13 +787,13 @@ export default function App() {
         <div className="brand-block">
           <p className="eyebrow">Local Quarto AI Studio</p>
           <h1>Thesis workspace</h1>
-          <p className="root-path">{project?.projects_root || '.runtime/projects'}</p>
+          <p className="root-path">{workspaceRootLabel}</p>
         </div>
         <div className="toolbar">
           <div className="workspace-mode-switcher">
             <button
               className={workspaceMode === 'manuscript' ? 'active' : ''}
-              disabled={isBusy}
+              disabled={isBusy || !workspaceConfigured}
               onClick={() => switchWorkspaceMode('manuscript')}
               type="button"
             >
@@ -523,7 +801,7 @@ export default function App() {
             </button>
             <button
               className={workspaceMode === 'analysis' ? 'active' : ''}
-              disabled={isBusy}
+              disabled={isBusy || !workspaceConfigured}
               onClick={() => switchWorkspaceMode('analysis')}
               type="button"
             >
@@ -539,45 +817,36 @@ export default function App() {
             <div className="file-menu-popover">
               <section className="file-menu-section">
                 <span className="file-menu-label">Workspace</span>
-                <p className="file-menu-current">{project?.active_project || 'thesis-draft'}</p>
-                <select
-                  disabled={isBusy || projects.length === 0}
-                  onChange={(event) => setSelectedProjectId(event.target.value)}
-                  value={selectedProjectId}
+                <p className="file-menu-current">{workspaceDisplayName}</p>
+                <button
+                  className="file-menu-action"
+                  disabled={isBusy}
+                  onClick={async () => {
+                    closeFileMenu();
+                    await chooseWorkspaceRoot();
+                  }}
+                  type="button"
                 >
-                  {projects.map((item) => (
-                    <option key={item.id} value={item.id}>{item.name}</option>
-                  ))}
-                </select>
-                <div className="file-menu-row">
-                  <button
-                    disabled={isBusy || !selectedProjectId}
-                    onClick={() => {
-                      closeFileMenu();
-                      openProject();
-                    }}
-                    type="button"
-                  >
-                    打开
-                  </button>
-                  <button
-                    disabled={isBusy}
-                    onClick={() => {
-                      closeFileMenu();
-                      setShowCreateProject(true);
-                    }}
-                    type="button"
-                  >
-                    <Plus size={16} />新建 Workspace
-                  </button>
-                </div>
+                  <FolderOpen size={16} />选择 Workspace 文件夹
+                </button>
+                <button
+                  className="file-menu-action"
+                  disabled={isBusy}
+                  onClick={() => {
+                    closeFileMenu();
+                    setShowWorkspaceRootModal(true);
+                  }}
+                  type="button"
+                >
+                  <Settings size={16} />手动输入路径
+                </button>
               </section>
 
               <section className="file-menu-section">
                 <span className="file-menu-label">Project Actions</span>
                 <button
                   className="file-menu-action"
-                  disabled={isBusy}
+                  disabled={isBusy || !workspaceConfigured}
                   onClick={() => {
                     closeFileMenu();
                     refresh();
@@ -588,7 +857,7 @@ export default function App() {
                 </button>
                 <button
                   className="file-menu-action"
-                  disabled={isBusy}
+                  disabled={isBusy || !workspaceConfigured}
                   onClick={() => {
                     closeFileMenu();
                     sourceImportRef.current?.click();
@@ -599,7 +868,7 @@ export default function App() {
                 </button>
                 <button
                   className="file-menu-action"
-                  disabled={isBusy}
+                  disabled={isBusy || !workspaceConfigured}
                   onClick={() => {
                     closeFileMenu();
                     exportDocx();
@@ -633,14 +902,38 @@ export default function App() {
 
       {message && <section className="notice">{message}</section>}
 
-      <section className={`workspace-grid ${workspaceMode === 'analysis' ? 'analysis-mode' : ''}`}>
+      {!workspaceConfigured ? (
+        <section className="workspace-empty-state">
+          <div className="workspace-empty-card">
+            <span className="workspace-empty-eyebrow">Workspace Required</span>
+            <h2>还没有选定 Workspace 文件夹</h2>
+            <p>
+              应用不再自动创建默认 `projects/`。请选择一个现有文件夹，或者输入一个新路径；只有在你明确选择后，系统才会创建并补齐标准目录结构。
+            </p>
+            <p className="workspace-empty-path">{workspaceRootLabel}</p>
+            {project?.workspace_error && <p className="workspace-empty-warning">{project.workspace_error}</p>}
+            <div className="workspace-empty-actions">
+              <button className="primary" disabled={isBusy} onClick={chooseWorkspaceRoot} type="button">
+                <FolderOpen size={18} />选择 Workspace 文件夹
+              </button>
+              <button disabled={isBusy} onClick={() => setShowWorkspaceRootModal(true)} type="button">
+                <Settings size={18} />手动输入路径
+              </button>
+            </div>
+          </div>
+        </section>
+      ) : (
+      <section
+        className={`workspace-grid ${workspaceMode === 'analysis' ? 'analysis-mode' : ''} ${workspaceMode === 'manuscript' && !previewFile ? 'manuscript-mode' : ''}`}
+        style={workspaceMode === 'manuscript' && !previewFile ? { '--manuscript-ai-width': `${manuscriptAiWidth}px` } : undefined}
+      >
         <aside className="project-panel">
           <section className="panel-section">
             <div className="panel-heading">
               <FolderOpen size={16} />
               <span>当前 Workspace</span>
             </div>
-            <p className="workspace-overview-name">{project?.active_project || 'thesis-draft'}</p>
+            <p className="workspace-overview-name">{workspaceDisplayName}</p>
             <p className="active-path">{project?.workspace}</p>
             <div className="analysis-mini-stats">
               {[
@@ -684,37 +977,94 @@ export default function App() {
             </div>
             <div className="file-browser">
               {files.map((group) => (
-                <details key={group.category} open={['Manuscript', 'Sources', 'Data'].includes(group.category)}>
+                <details
+                  className={`${canDropIntoCategory(group.category) ? 'file-drop-enabled' : ''}${dragOverCategory === group.category ? ' file-drop-target' : ''}`}
+                  key={group.category}
+                  onDragOver={(event) => {
+                    if (!canDropIntoCategory(group.category)) return;
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = 'move';
+                    if (dragOverCategory !== group.category) {
+                      setDragOverCategory(group.category);
+                    }
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    if (!canDropIntoCategory(group.category) || !draggedFile) {
+                      clearFileDragState();
+                      return;
+                    }
+                    moveWorkspaceFile(draggedFile, group.category);
+                  }}
+                  open={['Manuscript', 'Sources', 'Data'].includes(group.category)}
+                >
                   <summary>{categoryIcon(group.category)}{group.category}</summary>
                   {group.files.length === 0 && <p className="empty-line">No files</p>}
                   {group.files.map((file) => {
                     const isSwitchableManuscript = group.category === 'Manuscript' && file.extension === 'qmd';
                     const isActiveFile = file.relative_path === activeManuscript;
-                    if (isSwitchableManuscript) {
-                      return (
+                    return (
+                      <div
+                        className={`file-row ${isActiveFile || previewFile?.relative_path === file.relative_path ? 'active' : ''}${draggedFile?.relative_path === file.relative_path ? ' dragging' : ''}`}
+                        draggable={Boolean(file.can_move) && !isBusy}
+                        key={file.relative_path}
+                        onDragEnd={clearFileDragState}
+                        onDragStart={(event) => startFileDrag(event, file)}
+                      >
                         <button
-                          className={`file-row file-row-button ${isActiveFile ? 'active' : ''}`}
+                          className={`file-row-button ${isActiveFile || previewFile?.relative_path === file.relative_path ? 'active' : ''}`}
                           disabled={isBusy}
-                          key={file.relative_path}
-                          onClick={() => switchManuscript(file.relative_path)}
-                          title={`切换到 ${file.name}`}
+                          onClick={() => {
+                            if (isSwitchableManuscript) {
+                              switchManuscript(file.relative_path);
+                              return;
+                            }
+                            setPreviewFile(file);
+                          }}
+                          title={isSwitchableManuscript ? `切换到 ${file.name}` : `预览 ${file.name}`}
+                          type="button"
                         >
                           <span>{file.name}</span>
-                          <small>{file.size_label}</small>
                         </button>
-                      );
-                    }
-                    return (
-                      <button
-                        className={`file-row file-row-button${previewFile?.relative_path === file.relative_path ? ' active' : ''}`}
-                        key={file.relative_path}
-                        onClick={() => setPreviewFile(file)}
-                        title={`预览 ${file.name}`}
-                        type="button"
-                      >
-                        <span>{file.name}</span>
-                        <small>{file.size_label}</small>
-                      </button>
+                        <div className="file-row-side">
+                          <small>{file.size_label}</small>
+                          <div className="file-row-actions">
+                            {file.can_move && (
+                              <span className="file-action-hint" title="拖到其他分组以移动">
+                                <GripVertical size={14} />
+                              </span>
+                            )}
+                            {file.can_rename && (
+                              <button
+                                className="file-icon-button"
+                                disabled={isBusy}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  renameWorkspaceFile(file);
+                                }}
+                                title={`重命名 ${file.name}`}
+                                type="button"
+                              >
+                                <Pencil size={14} />
+                              </button>
+                            )}
+                            {file.can_delete && (
+                              <button
+                                className="file-icon-button danger"
+                                disabled={isBusy}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  deleteWorkspaceFile(file);
+                                }}
+                                title={`删除 ${file.name}`}
+                                type="button"
+                              >
+                                <Trash2 size={14} />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
                     );
                   })}
                 </details>
@@ -722,13 +1072,6 @@ export default function App() {
             </div>
           </section>
 
-          <section className={`quarto-box ${project?.quarto_available ? 'ready' : 'missing'}`}>
-            <div>
-              <strong>Quarto</strong>
-              <p>{project?.quarto_message}</p>
-            </div>
-            <CircleAlert size={18} />
-          </section>
         </aside>
 
         {previewFile ? (
@@ -796,34 +1139,48 @@ export default function App() {
               )}
             </section>
 
+            <div
+              aria-label="调整 AI 协作面板宽度"
+              className="workspace-resize-handle"
+              onDoubleClick={() => setManuscriptAiWidth(500)}
+              onMouseDown={startManuscriptResize}
+              role="separator"
+              title="拖拽调整 AI 协作面板宽度，双击恢复默认"
+            />
+
             <aside className="ai-panel">
               <div className="panel-heading">
                 <Sparkles size={16} />
                 <span>AI 协作</span>
               </div>
-              <div className="selection-box">
-                <span>当前选中</span>
-                <p>{selectedText ? selectedText.slice(0, 260) : '请先在正文里选中一段文字。'}</p>
-              </div>
-              <textarea
-                className="instruction"
-                value={instruction}
-                onChange={(event) => setInstruction(event.target.value)}
-              />
-              <button className="primary" onClick={askAi} disabled={isBusy || !selectedText} title="生成 AI 建议">
-                {busy === 'ai' ? <Loader2 className="spin" size={18} /> : <Bot size={18} />}
-                生成建议
-              </button>
-
-              <section className="source-strip">
-                <strong>已索引资料</strong>
-                <span>{sources.length} files</span>
-              </section>
-              <SuggestionPanel
-                isBusy={isBusy}
-                onApply={applySuggestion}
-                onReject={rejectSuggestion}
-                suggestion={suggestion}
+              <ChatPanel
+                tool="AI 协作"
+                title="持续协作会话"
+                messages={editorMessages}
+                isBusy={editorChatBusy}
+                onClear={clearEditorConversation}
+                onSend={sendEditorMessage}
+                placeholder="输入你想让 AI 如何修改，例如：润色摘要、压缩引言第二段、找出最该重写的段落并直接改。"
+                renderResult={renderEditorResult}
+                sendDisabled={!activeManuscript}
+                contextSlot={(
+                  <div className="editor-chat-context">
+                    <div className="selection-box">
+                      <span>{editorSelectionLabel}</span>
+                      <p>
+                        {editorNeedsFreshSelection
+                          ? '本轮建议已经处理完成。请在正文里重新选中一段文字，再继续新的协作。'
+                          : editorTargetText
+                            ? editorTargetText.slice(0, 260)
+                            : '可以先选中一段精确修改，也可以不选中，直接让 AI 根据你的指令在当前文稿里自行判断并提出可应用的改写。'}
+                      </p>
+                    </div>
+                    <section className="source-strip">
+                      <strong>已索引资料</strong>
+                      <span>{sources.length} files</span>
+                    </section>
+                  </div>
+                )}
               />
               <MemoryPanel memory={memory} />
             </aside>
@@ -839,6 +1196,7 @@ export default function App() {
           />
         )}
       </section>
+      )}
 
       {showSettings && (
         <SettingsModal
@@ -858,18 +1216,19 @@ export default function App() {
           switchProvider={switchProvider}
         />
       )}
+      {showWorkspaceRootModal && (
+        <WorkspaceRootModal
+          initialPath={project?.projects_root || project?.workspace_suggestion || ''}
+          isBusy={isBusy}
+          onClose={() => setShowWorkspaceRootModal(false)}
+          onSave={updateWorkspaceRoot}
+        />
+      )}
       {showCreateManuscript && (
         <NewManuscriptModal
           isBusy={isBusy}
           onClose={() => setShowCreateManuscript(false)}
           onCreate={createManuscript}
-        />
-      )}
-      {showCreateProject && (
-        <NewProjectModal
-          isBusy={isBusy}
-          onClose={() => setShowCreateProject(false)}
-          onCreate={createProject}
         />
       )}
     </main>

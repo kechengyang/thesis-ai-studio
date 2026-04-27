@@ -5,8 +5,11 @@ import { buildProjectFileUrl } from '../api';
 
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'svg', 'webp']);
 const TABLE_EXTS = new Set(['csv']);
+const TEXT_EXTS = new Set(['txt', 'md', 'markdown', 'bib', 'json', 'yaml', 'yml', 'toml', 'log', 'qmd']);
 const MAX_FULL_ROWS = 20;
 const MAX_COMPACT_ROWS = 5;
+const MAX_FULL_TEXT_CHARS = 120000;
+const MAX_COMPACT_TEXT_CHARS = 4000;
 
 function parseCSVRow(line) {
   const result = [];
@@ -37,6 +40,24 @@ async function fetchCSVPreview(relativePath, maxRows, signal) {
   const dataLines = lines.slice(1);
   const rows = dataLines.slice(0, maxRows).map(parseCSVRow);
   return { headers, rows, total: dataLines.length };
+}
+
+async function fetchTextPreview(relativePath, maxChars, signal) {
+  const url = buildProjectFileUrl(relativePath);
+  const response = await fetch(url, { signal });
+  if (!response.ok) throw new Error('Failed to fetch file');
+  const raw = (await response.text()).replace(/\r\n?/g, '\n');
+  const lines = raw.length ? raw.split('\n') : [];
+  const lineCount = lines.length;
+  const maxColumns = lines.reduce((max, line) => Math.max(max, line.length), 0);
+  const truncated = raw.length > maxChars;
+  return {
+    charCount: raw.length,
+    lineCount,
+    maxColumns,
+    text: truncated ? `${raw.slice(0, maxChars)}\n\n…` : raw,
+    truncated,
+  };
 }
 
 function TablePreview({ headers, rows, total, compact }) {
@@ -77,24 +98,42 @@ function TablePreview({ headers, rows, total, compact }) {
 export function FilePreview({ file, onClose, compact = false }) {
   const ext = (file?.extension || '').toLowerCase();
   const maxRows = compact ? MAX_COMPACT_ROWS : MAX_FULL_ROWS;
+  const maxTextChars = compact ? MAX_COMPACT_TEXT_CHARS : MAX_FULL_TEXT_CHARS;
 
   const [csvData, setCsvData] = useState(null);
+  const [textData, setTextData] = useState(null);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (!TABLE_EXTS.has(ext)) return;
+    if (!file) return undefined;
 
     const controller = new AbortController();
-    setLoading(true);
     setCsvData(null);
+    setTextData(null);
+    if (!TABLE_EXTS.has(ext) && !TEXT_EXTS.has(ext)) {
+      setLoading(false);
+      return () => controller.abort();
+    }
+    setLoading(true);
 
-    fetchCSVPreview(file.relative_path, maxRows, controller.signal)
-      .then((data) => { if (!controller.signal.aborted) setCsvData(data); })
-      .catch(() => { if (!controller.signal.aborted) setCsvData(null); })
+    const loadPreview = TABLE_EXTS.has(ext)
+      ? fetchCSVPreview(file.relative_path, maxRows, controller.signal).then((data) => {
+        if (!controller.signal.aborted) setCsvData(data);
+      })
+      : fetchTextPreview(file.relative_path, maxTextChars, controller.signal).then((data) => {
+        if (!controller.signal.aborted) setTextData(data);
+      });
+
+    loadPreview
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        setCsvData(null);
+        setTextData(null);
+      })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
 
     return () => controller.abort();
-  }, [file?.relative_path, ext, maxRows]);
+  }, [file, file?.relative_path, ext, maxRows, maxTextChars]);
 
   if (!file) return null;
 
@@ -117,11 +156,20 @@ export function FilePreview({ file, onClose, compact = false }) {
         />
       );
     }
+    if (textData) {
+      return (
+        <div className="data-inline-preview">
+          <div className="data-inline-preview-label">
+            文本预览 · {textData.lineCount} 行 / {textData.charCount} 字符
+          </div>
+        </div>
+      );
+    }
     // XLSX or load failure — metadata card
     return (
       <div className="data-inline-preview">
         <div className="data-inline-preview-label">
-          {file.name} · {file.size_label} · Excel 文件，已提取内容供 AI 分析
+          {file.name} · {file.size_label} · {ext === 'xlsx' || ext === 'xlsm' ? 'Excel 文件，已提取内容供 AI 分析' : '预览不可用'}
         </div>
       </div>
     );
@@ -151,6 +199,24 @@ export function FilePreview({ file, onClose, compact = false }) {
       }
       return <p className="file-preview-row-note">无法加载文件内容。</p>;
     }
+    if (TEXT_EXTS.has(ext)) {
+      if (loading) return <p className="file-preview-row-note">加载中...</p>;
+      if (textData) {
+        return (
+          <>
+            <div className="file-preview-text-wrap">
+              <pre className="file-preview-text">{textData.text || ' '}</pre>
+            </div>
+            <p className="file-preview-row-note">
+              {textData.truncated
+                ? `为保证性能，仅显示前 ${textData.text.length} 个字符 / 共 ${textData.charCount} 个字符。`
+                : `共 ${textData.lineCount} 行 · 最长 ${textData.maxColumns} 列。`}
+            </p>
+          </>
+        );
+      }
+      return <p className="file-preview-row-note">无法加载文本内容。</p>;
+    }
     // PDF, DOCX, XLSX, or unknown
     return (
       <div className="file-preview-meta-card">
@@ -167,7 +233,11 @@ export function FilePreview({ file, onClose, compact = false }) {
     );
   }
 
-  const metaSuffix = csvData ? `${csvData.total} 行 · ${csvData.headers.length} 列` : file.size_label;
+  const metaSuffix = csvData
+    ? `${csvData.total} 行 · ${csvData.headers.length} 列`
+    : textData
+      ? `${textData.lineCount} 行 · ${textData.maxColumns} 列`
+      : file.size_label;
 
   return (
     <section className="file-preview-panel">

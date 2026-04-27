@@ -1,9 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { BookText, Database, FileText, Image, Sparkles } from 'lucide-react';
+import { BookText, Bot, Database, FileText, Image, Loader2, Send, Sparkles, Trash2, User } from 'lucide-react';
 
 import { buildProjectFileUrl, chatApi, studioApi } from '../api';
-import { ChatPanel } from './ChatPanel';
-import { FilePreview } from './FilePreview';
 import { MermaidPreview } from './MermaidPreview';
 
 const TOOLS = ['literature', 'data', 'mindmap', 'brief'];
@@ -17,6 +15,21 @@ function compactLine(value, fallback = 'Not available') {
   const text = String(value || '').replace(/\s+/g, ' ').trim();
   if (!text) return fallback;
   return text;
+}
+
+function asHttpUrl(value) {
+  const text = String(value || '').trim();
+  return /^https?:\/\//i.test(text) ? text : '';
+}
+
+function ResultLink({ label, url }) {
+  const href = asHttpUrl(url);
+  if (!href) return null;
+  return (
+    <a className="analysis-result-link" href={href} rel="noreferrer" target="_blank">
+      {label}
+    </a>
+  );
 }
 
 // ── Result renderers ──────────────────────────────────────
@@ -74,6 +87,8 @@ function DataResult({ msg, outlineTitles, onRefreshWorkspace, onSetMessage, isBu
   });
 
   if (!result) return null;
+  const previewColumns = result.dataset_snapshot?.preview_columns || [];
+  const previewRows = result.dataset_snapshot?.preview_rows || [];
 
   async function handleInsert() {
     onSetBusy('analysis-insert');
@@ -97,6 +112,44 @@ function DataResult({ msg, outlineTitles, onRefreshWorkspace, onSetMessage, isBu
 
   return (
     <div>
+      {result.data_result && (
+        <div className="analysis-subcard" style={{ marginBottom: 8 }}>
+          <span>Data Result</span>
+          <p>{result.data_result}</p>
+        </div>
+      )}
+      {(result.supporting_data?.length > 0 || result.key_points?.length > 0) && (
+        <div className="analysis-subcard" style={{ marginBottom: 8 }}>
+          <span>Supporting Data</span>
+          <ul className="analysis-result-list">
+            {(result.supporting_data?.length > 0 ? result.supporting_data : result.key_points).map((item, i) => <li key={i}>{item}</li>)}
+          </ul>
+        </div>
+      )}
+      {previewColumns.length > 0 && previewRows.length > 0 && (
+        <div className="analysis-subcard" style={{ marginBottom: 8 }}>
+          <span>Dataset Snapshot</span>
+          <p className="analysis-meta">
+            {result.dataset_snapshot?.row_count || 0} rows · {result.dataset_snapshot?.column_count || 0} columns
+          </p>
+          <div className="analysis-table-wrap">
+            <table className="analysis-mini-table">
+              <thead>
+                <tr>
+                  {previewColumns.map((column) => <th key={column}>{column}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {previewRows.map((row, rowIndex) => (
+                  <tr key={rowIndex}>
+                    {previewColumns.map((column) => <td key={`${rowIndex}-${column}`}>{compactLine(row[column], '—')}</td>)}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
       <div className="analysis-figure-frame">
         <img
           alt={result.figure_alt_text || result.figure_title}
@@ -104,14 +157,6 @@ function DataResult({ msg, outlineTitles, onRefreshWorkspace, onSetMessage, isBu
           src={buildProjectFileUrl(result.figure_relative_path)}
         />
       </div>
-      {result.key_points?.length > 0 && (
-        <div className="analysis-subcard" style={{ marginTop: 8 }}>
-          <span>Key Points</span>
-          <ul className="analysis-result-list">
-            {result.key_points.map((item, i) => <li key={i}>{item}</li>)}
-          </ul>
-        </div>
-      )}
       <details style={{ marginTop: 8 }}>
         <summary className="analysis-inline-label">插入到文稿</summary>
         <div className="analysis-insert-grid" style={{ marginTop: 8 }}>
@@ -159,17 +204,38 @@ function DataResult({ msg, outlineTitles, onRefreshWorkspace, onSetMessage, isBu
   );
 }
 
-function LiteratureResult({ msg, onRefreshWorkspace, onSetMessage, isBusy, onSetBusy }) {
+function LiteratureResult({ msg, onActivateFocus, onRefreshWorkspace, onSetMessage, isBusy, onSetBusy }) {
   const { result } = msg;
   if (!result) return null;
-  const { analysis, cache_id, download_available } = result;
+  const {
+    analysis,
+    cache_id,
+    candidate,
+    download_available,
+    scholar_search_url,
+    search_results = [],
+  } = result;
+  const visibleResults = search_results.length > 0 ? search_results : (candidate ? [candidate] : []);
 
   async function handleImport(downloadOriginal) {
     onSetBusy(downloadOriginal ? 'literature-download' : 'literature-import');
     try {
       const data = await studioApi.importLiterature(cache_id, downloadOriginal);
       await onRefreshWorkspace();
-      onSetMessage(downloadOriginal ? `已下载并导入：${data.source.filename}` : `已导入文献摘要：${data.source.filename}`);
+      if (onActivateFocus) {
+        onActivateFocus({
+          cache_id: cache_id,
+          filename: data.source?.filename || '',
+          text_file: data.source?.text_file || '',
+          title: analysis?.title || candidate?.title || '',
+          downloaded_original: Boolean(data.source?.downloaded_original),
+        });
+      }
+      onSetMessage(
+        downloadOriginal
+          ? `已下载并导入：${data.source.filename}。现在可以继续追问文章内容，或让 AI 直接生成 literature review。`
+          : `已导入文献摘要：${data.source.filename}。如果需要围绕原文深入讨论，建议下载原文后继续追问。`,
+      );
     } catch (error) {
       onSetMessage(error.message);
     } finally {
@@ -179,9 +245,15 @@ function LiteratureResult({ msg, onRefreshWorkspace, onSetMessage, isBusy, onSet
 
   return (
     <div>
-      {analysis?.title && <strong style={{ display: 'block', marginBottom: 4 }}>{analysis.title}</strong>}
-      {(analysis?.authors?.length > 0 || analysis?.year) && (
-        <p className="analysis-meta">{analysis.authors?.join(', ')}{analysis.year ? ` (${analysis.year})` : ''}</p>
+      {(analysis?.title || candidate?.title) && (
+        <strong style={{ display: 'block', marginBottom: 4 }}>{analysis?.title || candidate?.title}</strong>
+      )}
+      {(analysis?.authors?.length > 0 || candidate?.authors?.length > 0 || analysis?.year || candidate?.year || analysis?.venue || candidate?.venue) && (
+        <p className="analysis-meta">
+          {(analysis?.authors?.length > 0 ? analysis.authors : candidate?.authors || []).join(', ')}
+          {(analysis?.year || candidate?.year) ? ` (${analysis?.year || candidate?.year})` : ''}
+          {analysis?.venue || candidate?.venue ? ` · ${analysis?.venue || candidate?.venue}` : ''}
+        </p>
       )}
       {analysis?.relevance && (
         <div className="analysis-subcard" style={{ marginTop: 8 }}>
@@ -197,19 +269,123 @@ function LiteratureResult({ msg, onRefreshWorkspace, onSetMessage, isBusy, onSet
           </ul>
         </div>
       )}
+      {(candidate?.source_url || candidate?.download_url || scholar_search_url) && (
+        <div className="analysis-subcard">
+          <span>Links</span>
+          <div className="analysis-link-list">
+            <ResultLink label="Primary source URL" url={candidate?.source_url} />
+            <ResultLink label="Download URL" url={candidate?.download_url} />
+            <ResultLink label="Google Scholar search" url={scholar_search_url} />
+          </div>
+        </div>
+      )}
+      {visibleResults.length > 0 && (
+        <div className="analysis-subcard">
+          <span>Candidate Results</span>
+          <ul className="analysis-result-list">
+            {visibleResults.map((item, index) => (
+              <li key={`${item.source_url || item.title || 'candidate'}-${index}`}>
+                <strong>{item.title || `Candidate ${index + 1}`}</strong>
+                {(item.authors?.length > 0 || item.year || item.venue) && (
+                  <span className="analysis-inline-note" style={{ display: 'block', marginTop: 2 }}>
+                    {(item.authors || []).slice(0, 4).join(', ')}
+                    {item.year ? ` (${item.year})` : ''}
+                    {item.venue ? ` · ${item.venue}` : ''}
+                  </span>
+                )}
+                <div className="analysis-link-list" style={{ marginTop: 6 }}>
+                  <ResultLink label="Source URL" url={item.source_url} />
+                  <ResultLink label="Download URL" url={item.download_url} />
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {analysis?.citation_uses?.length > 0 && (
+        <div className="analysis-subcard">
+          <span>Citation Uses</span>
+          <ul className="analysis-result-list">
+            {analysis.citation_uses.map((item, i) => <li key={i}>{item}</li>)}
+          </ul>
+        </div>
+      )}
+      {analysis?.literature_review && (
+        <div className="analysis-subcard">
+          <span>Literature Review Draft</span>
+          <p>{analysis.literature_review}</p>
+        </div>
+      )}
+      {result?.output_relative_path && (
+        <p className="analysis-inline-note" style={{ marginTop: 8 }}>
+          Literature review 已保存到 {result.output_relative_path}
+        </p>
+      )}
+      {analysis?.discussion_points?.length > 0 && (
+        <div className="analysis-subcard">
+          <span>Discussion Points</span>
+          <ul className="analysis-result-list">
+            {analysis.discussion_points.map((item, i) => <li key={i}>{item}</li>)}
+          </ul>
+        </div>
+      )}
       {analysis?.import_recommendation && (
         <p className="analysis-inline-note" style={{ marginTop: 8 }}>{analysis.import_recommendation}</p>
       )}
+      <p className="analysis-inline-note" style={{ marginTop: 8 }}>
+        优先直接提供论文标题、DOI 或 URL。若目前只有主题词，可先点 Google Scholar 搜索，再把具体条目链接发回来。
+      </p>
       <div className="analysis-actions" style={{ marginTop: 10 }}>
         <button className="primary" disabled={isBusy || !cache_id} onClick={() => handleImport(false)} type="button">
           导入摘要
         </button>
         {download_available && (
           <button disabled={isBusy || !cache_id} onClick={() => handleImport(true)} type="button">
-            下载原文
+            下载原文并导入
           </button>
         )}
       </div>
+    </div>
+  );
+}
+
+// ── Chat history bubbles ───────────────────────────────────
+
+function ToolHistoryArea({ messages, isBusy, renderResult }) {
+  const bottomRef = useRef(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, isBusy]);
+
+  if (messages.length === 0 && !isBusy) return null;
+
+  return (
+    <div className="tool-history-area">
+      {messages.map((msg) => (
+        <div key={msg.id} className={`chat-bubble-row ${msg.role === 'user' ? 'user' : 'assistant'}`}>
+          <div className="chat-bubble-avatar">
+            {msg.role === 'user' ? <User size={14} /> : <Bot size={14} />}
+          </div>
+          <div className="chat-bubble">
+            <p className="chat-bubble-content">{msg.content}</p>
+            {msg.role === 'assistant' && msg.result && renderResult && (
+              <div className="chat-bubble-result">{renderResult(msg)}</div>
+            )}
+            <span className="chat-bubble-time">{msg.timestamp?.slice(0, 16).replace('T', ' ')}</span>
+          </div>
+        </div>
+      ))}
+      {isBusy && (
+        <div className="chat-bubble-row assistant">
+          <div className="chat-bubble-avatar"><Bot size={14} /></div>
+          <div className="chat-bubble chat-bubble-loading">
+            <Loader2 className="spin" size={16} />
+            <span>AI 正在思考...</span>
+          </div>
+        </div>
+      )}
+      <div ref={bottomRef} />
     </div>
   );
 }
@@ -242,17 +418,19 @@ export function AnalysisWorkspace({
   const [selectedDataFile, setSelectedDataFile] = useState('');
   const [briefFormat, setBriefFormat] = useState('ppt');
   const [briefScopeHeading, setBriefScopeHeading] = useState('');
-  const [inlinePreviewFile, setInlinePreviewFile] = useState(null);
+  const [literatureFocus, setLiteratureFocus] = useState(null);
+
+  const [toolInput, setToolInput] = useState({ literature: '', data: '', mindmap: '', brief: '' });
 
   const [chatHistories, setChatHistories] = useState({
     literature: [], data: [], mindmap: [], brief: [],
   });
   const [chatBusy, setChatBusy] = useState('');
+  const anyChatBusy = chatBusy !== '';
 
   const [sidebarWidth, setSidebarWidth] = useState(300);
   const dragRef = useRef({ active: false, startX: 0, startWidth: 0 });
 
-  // Load all chat histories on mount or project switch
   useEffect(() => {
     Promise.all(TOOLS.map((tool) => chatApi.load(tool).then((data) => ({ tool, history: data.history || [] }))))
       .then((results) => {
@@ -263,7 +441,25 @@ export function AnalysisWorkspace({
       .catch(() => {});
   }, [project?.workspace]);
 
-  // Keep selected data file in sync
+  useEffect(() => {
+    if (literatureFocus?.text_file) return;
+    const history = chatHistories.literature || [];
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      const item = history[index];
+      const focus = item?.result?.source_focus || item?.context || null;
+      if (focus?.text_file) {
+        setLiteratureFocus({
+          cache_id: focus.cache_id || '',
+          filename: focus.filename || '',
+          text_file: focus.text_file || '',
+          title: focus.title || '',
+          downloaded_original: Boolean(focus.downloaded_original),
+        });
+        return;
+      }
+    }
+  }, [chatHistories.literature, literatureFocus]);
+
   useEffect(() => {
     if (!selectedDataFile && dataFiles[0]) {
       setSelectedDataFile(dataFiles[0].relative_path);
@@ -272,12 +468,6 @@ export function AnalysisWorkspace({
     if (selectedDataFile && dataFiles.some((item) => item.relative_path === selectedDataFile)) return;
     setSelectedDataFile(dataFiles[0]?.relative_path || '');
   }, [dataFiles, selectedDataFile]);
-
-  useEffect(() => {
-    if (!selectedDataFile) { setInlinePreviewFile(null); return; }
-    const found = dataFiles.find((f) => f.relative_path === selectedDataFile);
-    setInlinePreviewFile(found || null);
-  }, [selectedDataFile, dataFiles]);
 
   useEffect(() => {
     function onMouseMove(event) {
@@ -299,14 +489,21 @@ export function AnalysisWorkspace({
     event.preventDefault();
   }
 
-  async function handleSend(tool, message) {
+  async function handleSend(tool) {
+    const message = toolInput[tool].trim();
+    if (!message || chatBusy) return;
+
     const context = tool === 'data'
       ? { relative_path: selectedDataFile }
       : tool === 'brief'
-      ? { format: briefFormat, scope_heading: briefScopeHeading }
-      : {};
+        ? { format: briefFormat, scope_heading: briefScopeHeading }
+        : tool === 'literature' && literatureFocus?.text_file
+          ? { ...literatureFocus }
+          : {};
 
     setChatBusy(tool);
+    setToolInput((prev) => ({ ...prev, [tool]: '' }));
+
     const optimisticUser = {
       id: `optimistic-${Date.now()}`,
       role: 'user',
@@ -328,12 +525,12 @@ export function AnalysisWorkspace({
         [tool]: [...prev[tool].filter((m) => m.id !== optimisticUser.id), optimisticUser, assistantMsg],
       }));
       await onRefreshWorkspace();
-      onSetMessage('AI 回复已生成。');
     } catch (error) {
       setChatHistories((prev) => ({
         ...prev,
         [tool]: prev[tool].filter((m) => m.id !== optimisticUser.id),
       }));
+      setToolInput((prev) => ({ ...prev, [tool]: message }));
       onSetMessage(error.message);
     } finally {
       setChatBusy('');
@@ -344,87 +541,77 @@ export function AnalysisWorkspace({
     try {
       await chatApi.clear(tool);
       setChatHistories((prev) => ({ ...prev, [tool]: [] }));
-      onSetMessage(`${tool} 对话已清空。`);
+      if (tool === 'literature') {
+        setLiteratureFocus(null);
+      }
     } catch (error) {
       onSetMessage(error.message);
+    }
+  }
+
+  function handleKeyDown(tool, event) {
+    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+      handleSend(tool);
     }
   }
 
   const activeManuscriptName = project?.active_manuscript?.split('/').pop() || 'No manuscript';
 
   const toolOptions = [
-    { id: 'literature', label: 'Literature', hint: '资料检索 + 结构判断', icon: BookText },
+    { id: 'literature', label: 'Literature', hint: '标题 / DOI / URL + Scholar fallback', icon: BookText },
     { id: 'data', label: 'Data Analysis', hint: '图表生成 + 文中插入', icon: Database },
     { id: 'mindmap', label: 'Mindmap', hint: 'Mermaid 理论图谱', icon: Sparkles },
     { id: 'brief', label: 'PPT / Poster Brief', hint: '展示摘要 + key messages', icon: FileText },
   ];
 
-  function renderResult(tool) {
+  function makeRenderResult(tool) {
     return (msg) => {
       if (tool === 'mindmap') return <MindmapResult msg={msg} />;
       if (tool === 'brief') return <BriefResult msg={msg} />;
       if (tool === 'data') return (
         <DataResult
-          msg={msg}
-          outlineTitles={outlineTitles}
-          onRefreshWorkspace={onRefreshWorkspace}
-          onSetMessage={onSetMessage}
           isBusy={isBusy || chatBusy === 'data'}
+          msg={msg}
+          onRefreshWorkspace={onRefreshWorkspace}
           onSetBusy={onSetBusy}
+          onSetMessage={onSetMessage}
+          outlineTitles={outlineTitles}
         />
       );
       if (tool === 'literature') return (
         <LiteratureResult
-          msg={msg}
-          onRefreshWorkspace={onRefreshWorkspace}
-          onSetMessage={onSetMessage}
           isBusy={isBusy || chatBusy === 'literature'}
+          msg={msg}
+          onActivateFocus={setLiteratureFocus}
+          onRefreshWorkspace={onRefreshWorkspace}
           onSetBusy={onSetBusy}
+          onSetMessage={onSetMessage}
         />
       );
       return null;
     };
   }
 
-  function contextSlot(tool) {
-    if (tool === 'data') return (
-      <>
-        <select
-          disabled={isBusy || chatBusy === 'data' || dataFiles.length === 0}
-          onChange={(e) => setSelectedDataFile(e.target.value)}
-          value={selectedDataFile}
-          style={{ flex: 1 }}
-        >
-          {dataFiles.length === 0 && <option value="">No data files</option>}
-          {dataFiles.map((f) => <option key={f.relative_path} value={f.relative_path}>{f.name}</option>)}
-        </select>
-        {inlinePreviewFile && <FilePreview compact file={inlinePreviewFile} />}
-      </>
-    );
-    if (tool === 'brief') return (
-      <>
-        <select
-          disabled={isBusy || chatBusy === 'brief'}
-          onChange={(e) => setBriefFormat(e.target.value)}
-          value={briefFormat}
-        >
-          <option value="ppt">PPT</option>
-          <option value="poster">Poster</option>
-          <option value="summary">Article Summary</option>
-          <option value="custom">Custom</option>
-        </select>
-        <select
-          disabled={isBusy || chatBusy === 'brief'}
-          onChange={(e) => setBriefScopeHeading(e.target.value)}
-          value={briefScopeHeading}
-        >
-          <option value="">Whole Manuscript</option>
-          {outlineTitles.map((t) => <option key={t} value={t}>{t}</option>)}
-        </select>
-      </>
-    );
-    return null;
-  }
+  const toolConfig = {
+    literature: {
+      placeholder: literatureFocus?.text_file
+        ? `当前正围绕「${literatureFocus.title || literatureFocus.filename}」讨论。可以继续追问文章内容，或直接让 AI 生成 literature review。`
+        : '优先输入论文标题、DOI 或 URL；如果还没有具体条目，也可以先输入主题，我会给你候选结果和 Scholar 搜索入口。',
+      label: '文献查找 / 分析',
+    },
+    data: {
+      placeholder: '描述希望生成什么图表，或对上一张图的修改意见...',
+      label: '数据分析',
+    },
+    mindmap: {
+      placeholder: '描述理论框架、概念关系或想要可视化的结构...',
+      label: '思维导图',
+    },
+    brief: {
+      placeholder: '补充说明，或对上一版 brief 的修改意见（可留空直接生成）...',
+      label: '展示摘要',
+    },
+  };
 
   return (
     <section className="analysis-shell" style={{ '--sidebar-w': `${sidebarWidth}px` }}>
@@ -458,7 +645,7 @@ export function AnalysisWorkspace({
               {dataFiles.map((file) => (
                 <button
                   className={`analysis-file-button ${selectedDataFile === file.relative_path ? 'active' : ''}`}
-                  disabled={isBusy || chatBusy !== ''}
+                  disabled={isBusy || chatBusy === 'data'}
                   key={file.relative_path}
                   onClick={() => setSelectedDataFile(file.relative_path)}
                   type="button"
@@ -499,7 +686,6 @@ export function AnalysisWorkspace({
             return (
               <button
                 className={activeTool === tool.id ? 'active' : ''}
-                disabled={isBusy || (chatBusy !== '' && chatBusy !== tool.id)}
                 key={tool.id}
                 onClick={() => setActiveTool(tool.id)}
                 type="button"
@@ -507,7 +693,7 @@ export function AnalysisWorkspace({
                 <div className="analysis-tool-icon"><Icon size={16} /></div>
                 <div className="analysis-tool-copy">
                   <strong>{tool.label}</strong>
-                  <small>{tool.hint}</small>
+                  <small>{chatBusy === tool.id ? `${tool.hint} · AI 思考中` : tool.hint}</small>
                 </div>
               </button>
             );
@@ -515,22 +701,115 @@ export function AnalysisWorkspace({
         </div>
 
         <div className="analysis-chat-area">
-          {toolOptions.map((tool) => (
-            <div
-              key={tool.id}
-              style={{ display: activeTool === tool.id ? 'flex' : 'none', flexDirection: 'column', height: '100%' }}
-            >
-              <ChatPanel
-                tool={tool.id}
-                messages={chatHistories[tool.id]}
-                isBusy={chatBusy === tool.id}
-                onSend={(message) => handleSend(tool.id, message)}
-                onClear={() => handleClear(tool.id)}
-                contextSlot={contextSlot(tool.id)}
-                renderResult={renderResult(tool.id)}
-              />
-            </div>
-          ))}
+          {toolOptions.map((tool) => {
+            const cfg = toolConfig[tool.id];
+            const messages = chatHistories[tool.id];
+            const busy = chatBusy === tool.id;
+            const inputVal = toolInput[tool.id];
+
+            return (
+              <div
+                className="tool-panel"
+                key={tool.id}
+                style={{ display: activeTool === tool.id ? 'flex' : 'none' }}
+              >
+                {/* Chat history (hidden when empty) */}
+                <ToolHistoryArea
+                  isBusy={busy}
+                  messages={messages}
+                  renderResult={makeRenderResult(tool.id)}
+                />
+
+                {/* Form area */}
+                <div className="tool-form-area">
+                  <div className="tool-form-top-row">
+                    <span className="tool-form-label">{cfg.label}</span>
+                    {messages.length > 0 && (
+                      <button
+                        className="chat-clear-btn"
+                        disabled={anyChatBusy}
+                        onClick={() => handleClear(tool.id)}
+                        type="button"
+                      >
+                        <Trash2 size={13} />
+                        清空对话
+                      </button>
+                    )}
+                  </div>
+
+                  {tool.id === 'literature' && literatureFocus?.text_file && (
+                    <div className="analysis-subcard">
+                      <span>Current Source Focus</span>
+                      <p>{literatureFocus.title || literatureFocus.filename}</p>
+                      <div className="analysis-actions">
+                        <span>{literatureFocus.downloaded_original ? '已下载原文，可继续讨论全文并生成 literature review。' : '当前基于已导入文本摘要进行讨论。'}</span>
+                        <button onClick={() => setLiteratureFocus(null)} type="button">清除焦点</button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Tool-specific selectors */}
+                  {tool.id === 'data' && (
+                    <div className="tool-form-controls">
+                      <select
+                        disabled={isBusy || chatBusy === 'data' || dataFiles.length === 0}
+                        onChange={(e) => setSelectedDataFile(e.target.value)}
+                        value={selectedDataFile}
+                      >
+                        {dataFiles.length === 0 && <option value="">No data files</option>}
+                        {dataFiles.map((f) => <option key={f.relative_path} value={f.relative_path}>{f.name}</option>)}
+                      </select>
+                    </div>
+                  )}
+
+                  {tool.id === 'brief' && (
+                    <div className="tool-form-controls">
+                      <select
+                        disabled={busy}
+                        onChange={(e) => setBriefFormat(e.target.value)}
+                        value={briefFormat}
+                      >
+                        <option value="ppt">PPT</option>
+                        <option value="poster">Poster</option>
+                        <option value="summary">Article Summary</option>
+                        <option value="custom">Custom</option>
+                      </select>
+                      <select
+                        disabled={busy}
+                        onChange={(e) => setBriefScopeHeading(e.target.value)}
+                        value={briefScopeHeading}
+                      >
+                        <option value="">Whole Manuscript</option>
+                        {outlineTitles.map((t) => <option key={t} value={t}>{t}</option>)}
+                      </select>
+                    </div>
+                  )}
+
+                  {/* Prompt input */}
+                  <div className="tool-form-input-row">
+                    <textarea
+                      className="chat-input"
+                      disabled={busy}
+                      onChange={(e) => setToolInput((prev) => ({ ...prev, [tool.id]: e.target.value }))}
+                      onKeyDown={(e) => handleKeyDown(tool.id, e)}
+                      placeholder={cfg.placeholder}
+                      rows={3}
+                      value={inputVal}
+                    />
+                    <button
+                      className="primary chat-send-btn"
+                      disabled={anyChatBusy || !inputVal.trim()}
+                      onClick={() => handleSend(tool.id)}
+                      title="发送 (Cmd+Enter)"
+                      type="button"
+                    >
+                      {busy ? <Loader2 className="spin" size={16} /> : <Send size={16} />}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
         </div>
       </section>
     </section>
