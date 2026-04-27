@@ -227,6 +227,7 @@ export default function App() {
     if (nextMode === workspaceMode) return;
     setBusy('workspace-mode');
     try {
+      setPreviewFile(null);
       if (nextMode === 'analysis') {
         await saveCurrentIfDirty();
       }
