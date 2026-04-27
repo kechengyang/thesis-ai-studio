@@ -26,9 +26,9 @@ function parseCSVRow(line) {
   return result;
 }
 
-async function fetchCSVPreview(relativePath, maxRows) {
+async function fetchCSVPreview(relativePath, maxRows, signal) {
   const url = buildProjectFileUrl(relativePath);
-  const response = await fetch(url);
+  const response = await fetch(url, { signal });
   if (!response.ok) throw new Error('Failed to fetch file');
   const text = await response.text();
   const lines = text.split('\n').filter((l) => l.trim());
@@ -83,12 +83,17 @@ export function FilePreview({ file, onClose, compact = false }) {
 
   useEffect(() => {
     if (!TABLE_EXTS.has(ext)) return;
+
+    const controller = new AbortController();
     setLoading(true);
     setCsvData(null);
-    fetchCSVPreview(file.relative_path, maxRows)
-      .then(setCsvData)
-      .catch(() => setCsvData(null))
-      .finally(() => setLoading(false));
+
+    fetchCSVPreview(file.relative_path, maxRows, controller.signal)
+      .then((data) => { if (!controller.signal.aborted) setCsvData(data); })
+      .catch(() => { if (!controller.signal.aborted) setCsvData(null); })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+
+    return () => controller.abort();
   }, [file?.relative_path, ext, maxRows]);
 
   if (!file) return null;
