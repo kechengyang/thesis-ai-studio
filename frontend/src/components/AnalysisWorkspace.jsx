@@ -1,10 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { BookText, Database, FileText, Image, Sparkles } from 'lucide-react';
 
-import { buildProjectFileUrl, studioApi } from '../api';
+import { buildProjectFileUrl, chatApi, studioApi } from '../api';
+import { ChatPanel } from './ChatPanel';
 import { FilePreview } from './FilePreview';
-import { LiteraturePanel } from './LiteraturePanel';
 import { MermaidPreview } from './MermaidPreview';
+
+const TOOLS = ['literature', 'data', 'mindmap', 'brief'];
 
 function filesByCategory(project, category) {
   const match = (project?.files || []).find((item) => item.category === category);
@@ -17,32 +19,202 @@ function compactLine(value, fallback = 'Not available') {
   return text;
 }
 
-function baseName(relativePath) {
-  return relativePath ? relativePath.split('/').pop() : '';
+// ── Result renderers ──────────────────────────────────────
+
+function MindmapResult({ msg }) {
+  const { result } = msg;
+  if (!result) return null;
+  return (
+    <div>
+      <div className="analysis-figure-frame">
+        <MermaidPreview code={result.mermaid} />
+      </div>
+      <details className="analysis-code-block" style={{ marginTop: 8 }}>
+        <summary>查看 Mermaid 代码 / Quarto Snippet</summary>
+        <pre>{result.quarto_block}</pre>
+      </details>
+      <p className="analysis-inline-note" style={{ marginTop: 6 }}>{result.output_relative_path}</p>
+    </div>
+  );
 }
 
-function PreviewList({ items }) {
-  if (!items?.length) return <p className="empty-line">No items yet</p>;
+function BriefResult({ msg }) {
+  const { result } = msg;
+  if (!result) return null;
   return (
-    <div className="analysis-sidebar-list">
-      {items.map((item) => (
-        <div className="analysis-sidebar-item" key={item.relative_path || item.name}>
-          <strong>{item.name}</strong>
-          <span>{item.size_label}</span>
+    <div>
+      <p className="analysis-meta">{compactLine(result.target_format)} · {compactLine(result.focus)}</p>
+      {result.one_liner && (
+        <div className="analysis-subcard">
+          <span>One-liner</span>
+          <p>{result.one_liner}</p>
         </div>
-      ))}
+      )}
+      {result.key_messages?.length > 0 && (
+        <div className="analysis-subcard">
+          <span>Key Messages</span>
+          <ul className="analysis-result-list">
+            {result.key_messages.map((item, i) => <li key={i}>{item}</li>)}
+          </ul>
+        </div>
+      )}
+      <p className="analysis-inline-note" style={{ marginTop: 6 }}>{result.output_relative_path}</p>
     </div>
   );
 }
 
-function AnalysisPlaceholder({ title, copy }) {
+function DataResult({ msg, outlineTitles, onRefreshWorkspace, onSetMessage, isBusy, onSetBusy }) {
+  const { result } = msg;
+  const [insertForm, setInsertForm] = useState({
+    figure_title: result?.figure_title || '',
+    figure_caption: result?.figure_caption || '',
+    figure_alt_text: result?.figure_alt_text || '',
+    section_title: result?.suggested_section || '',
+    introduction: result?.insert_paragraph || '',
+  });
+
+  if (!result) return null;
+
+  async function handleInsert() {
+    onSetBusy('analysis-insert');
+    try {
+      await studioApi.insertDataFigure({
+        figure_relative_path: result.figure_relative_path,
+        figure_title: insertForm.figure_title,
+        figure_caption: insertForm.figure_caption,
+        figure_alt_text: insertForm.figure_alt_text,
+        section_title: insertForm.section_title,
+        introduction: insertForm.introduction,
+      });
+      await onRefreshWorkspace();
+      onSetMessage(`图表已插入到 ${insertForm.section_title || '当前文稿'}。`);
+    } catch (error) {
+      onSetMessage(error.message);
+    } finally {
+      onSetBusy('');
+    }
+  }
+
   return (
-    <div className="analysis-placeholder">
-      <strong>{title}</strong>
-      <p>{copy}</p>
+    <div>
+      <div className="analysis-figure-frame">
+        <img
+          alt={result.figure_alt_text || result.figure_title}
+          className="analysis-figure-preview"
+          src={buildProjectFileUrl(result.figure_relative_path)}
+        />
+      </div>
+      {result.key_points?.length > 0 && (
+        <div className="analysis-subcard" style={{ marginTop: 8 }}>
+          <span>Key Points</span>
+          <ul className="analysis-result-list">
+            {result.key_points.map((item, i) => <li key={i}>{item}</li>)}
+          </ul>
+        </div>
+      )}
+      <details style={{ marginTop: 8 }}>
+        <summary className="analysis-inline-label">插入到文稿</summary>
+        <div className="analysis-insert-grid" style={{ marginTop: 8 }}>
+          <label>
+            插入位置
+            <input
+              list="chat-section-options"
+              onChange={(e) => setInsertForm((c) => ({ ...c, section_title: e.target.value }))}
+              value={insertForm.section_title}
+            />
+            <datalist id="chat-section-options">
+              {outlineTitles.map((t) => <option key={t} value={t} />)}
+            </datalist>
+          </label>
+          <label>
+            图表标题
+            <input
+              onChange={(e) => setInsertForm((c) => ({ ...c, figure_title: e.target.value }))}
+              value={insertForm.figure_title}
+            />
+          </label>
+          <label className="analysis-span-2">
+            Caption
+            <textarea
+              onChange={(e) => setInsertForm((c) => ({ ...c, figure_caption: e.target.value }))}
+              value={insertForm.figure_caption}
+            />
+          </label>
+          <label className="analysis-span-2">
+            引入段落
+            <textarea
+              onChange={(e) => setInsertForm((c) => ({ ...c, introduction: e.target.value }))}
+              value={insertForm.introduction}
+            />
+          </label>
+        </div>
+        <div className="analysis-actions" style={{ marginTop: 8 }}>
+          <button className="primary" disabled={isBusy} onClick={handleInsert} type="button">
+            插入到当前文稿
+          </button>
+        </div>
+      </details>
+      <p className="analysis-inline-note" style={{ marginTop: 6 }}>{result.figure_relative_path}</p>
     </div>
   );
 }
+
+function LiteratureResult({ msg, onRefreshWorkspace, onSetMessage, isBusy, onSetBusy }) {
+  const { result } = msg;
+  if (!result) return null;
+  const { analysis, cache_id, download_available } = result;
+
+  async function handleImport(downloadOriginal) {
+    onSetBusy(downloadOriginal ? 'literature-download' : 'literature-import');
+    try {
+      const data = await studioApi.importLiterature(cache_id, downloadOriginal);
+      await onRefreshWorkspace();
+      onSetMessage(downloadOriginal ? `已下载并导入：${data.source.filename}` : `已导入文献摘要：${data.source.filename}`);
+    } catch (error) {
+      onSetMessage(error.message);
+    } finally {
+      onSetBusy('');
+    }
+  }
+
+  return (
+    <div>
+      {analysis?.title && <strong style={{ display: 'block', marginBottom: 4 }}>{analysis.title}</strong>}
+      {(analysis?.authors?.length > 0 || analysis?.year) && (
+        <p className="analysis-meta">{analysis.authors?.join(', ')}{analysis.year ? ` (${analysis.year})` : ''}</p>
+      )}
+      {analysis?.relevance && (
+        <div className="analysis-subcard" style={{ marginTop: 8 }}>
+          <span>Relevance</span>
+          <p>{analysis.relevance}</p>
+        </div>
+      )}
+      {analysis?.structure_suggestions?.length > 0 && (
+        <div className="analysis-subcard">
+          <span>Structure Suggestions</span>
+          <ul className="analysis-result-list">
+            {analysis.structure_suggestions.map((s, i) => <li key={i}>{s}</li>)}
+          </ul>
+        </div>
+      )}
+      {analysis?.import_recommendation && (
+        <p className="analysis-inline-note" style={{ marginTop: 8 }}>{analysis.import_recommendation}</p>
+      )}
+      <div className="analysis-actions" style={{ marginTop: 10 }}>
+        <button className="primary" disabled={isBusy || !cache_id} onClick={() => handleImport(false)} type="button">
+          导入摘要
+        </button>
+        {download_available && (
+          <button disabled={isBusy || !cache_id} onClick={() => handleImport(true)} type="button">
+            下载原文
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── AnalysisWorkspace ────────────────────────────────────
 
 export function AnalysisWorkspace({
   isBusy,
@@ -68,31 +240,44 @@ export function AnalysisWorkspace({
 
   const [activeTool, setActiveTool] = useState('literature');
   const [selectedDataFile, setSelectedDataFile] = useState('');
-  const [dataPrompt, setDataPrompt] = useState('');
-  const [dataResult, setDataResult] = useState(null);
-  const [insertForm, setInsertForm] = useState({
-    figure_title: '',
-    figure_caption: '',
-    figure_alt_text: '',
-    section_title: '',
-    introduction: '',
-  });
-
-  const [mindmapPrompt, setMindmapPrompt] = useState('');
-  const [mindmapResult, setMindmapResult] = useState(null);
-
-  const [briefPrompt, setBriefPrompt] = useState('');
   const [briefFormat, setBriefFormat] = useState('ppt');
   const [briefScopeHeading, setBriefScopeHeading] = useState('');
-  const [briefResult, setBriefResult] = useState(null);
-
-  const [literatureQuery, setLiteratureQuery] = useState('');
-  const [literatureResult, setLiteratureResult] = useState(null);
-
   const [inlinePreviewFile, setInlinePreviewFile] = useState(null);
+
+  const [chatHistories, setChatHistories] = useState({
+    literature: [], data: [], mindmap: [], brief: [],
+  });
+  const [chatBusy, setChatBusy] = useState('');
 
   const [sidebarWidth, setSidebarWidth] = useState(300);
   const dragRef = useRef({ active: false, startX: 0, startWidth: 0 });
+
+  // Load all chat histories on mount or project switch
+  useEffect(() => {
+    Promise.all(TOOLS.map((tool) => chatApi.load(tool).then((data) => ({ tool, history: data.history || [] }))))
+      .then((results) => {
+        const histories = {};
+        for (const { tool, history } of results) histories[tool] = history;
+        setChatHistories(histories);
+      })
+      .catch(() => {});
+  }, [project?.workspace]);
+
+  // Keep selected data file in sync
+  useEffect(() => {
+    if (!selectedDataFile && dataFiles[0]) {
+      setSelectedDataFile(dataFiles[0].relative_path);
+      return;
+    }
+    if (selectedDataFile && dataFiles.some((item) => item.relative_path === selectedDataFile)) return;
+    setSelectedDataFile(dataFiles[0]?.relative_path || '');
+  }, [dataFiles, selectedDataFile]);
+
+  useEffect(() => {
+    if (!selectedDataFile) { setInlinePreviewFile(null); return; }
+    const found = dataFiles.find((f) => f.relative_path === selectedDataFile);
+    setInlinePreviewFile(found || null);
+  }, [selectedDataFile, dataFiles]);
 
   useEffect(() => {
     function onMouseMove(event) {
@@ -100,9 +285,7 @@ export function AnalysisWorkspace({
       const delta = event.clientX - dragRef.current.startX;
       setSidebarWidth(Math.max(180, Math.min(520, dragRef.current.startWidth + delta)));
     }
-    function onMouseUp() {
-      dragRef.current.active = false;
-    }
+    function onMouseUp() { dragRef.current.active = false; }
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseup', onMouseUp);
     return () => {
@@ -116,190 +299,132 @@ export function AnalysisWorkspace({
     event.preventDefault();
   }
 
-  useEffect(() => {
-    if (!selectedDataFile && dataFiles[0]) {
-      setSelectedDataFile(dataFiles[0].relative_path);
-      return;
-    }
-    if (selectedDataFile && dataFiles.some((item) => item.relative_path === selectedDataFile)) {
-      return;
-    }
-    setSelectedDataFile(dataFiles[0]?.relative_path || '');
-  }, [dataFiles, selectedDataFile]);
+  async function handleSend(tool, message) {
+    const context = tool === 'data'
+      ? { relative_path: selectedDataFile }
+      : tool === 'brief'
+      ? { format: briefFormat, scope_heading: briefScopeHeading }
+      : {};
 
-  useEffect(() => {
-    if (!selectedDataFile) {
-      setInlinePreviewFile(null);
-      return;
-    }
-    const found = dataFiles.find((f) => f.relative_path === selectedDataFile);
-    setInlinePreviewFile(found || null);
-  }, [selectedDataFile, dataFiles]);
+    setChatBusy(tool);
+    const optimisticUser = {
+      id: `optimistic-${Date.now()}`,
+      role: 'user',
+      timestamp: new Date().toISOString().slice(0, 19),
+      content: message,
+      context,
+    };
+    setChatHistories((prev) => ({
+      ...prev,
+      [tool]: [...prev[tool], optimisticUser],
+    }));
 
-  useEffect(() => {
-    const analysis = dataResult?.analysis || null;
-    if (!analysis) return;
-    setInsertForm({
-      figure_title: analysis.figure_title || '',
-      figure_caption: analysis.figure_caption || '',
-      figure_alt_text: analysis.figure_alt_text || '',
-      section_title: analysis.suggested_section || '',
-      introduction: analysis.insert_paragraph || '',
-    });
-  }, [dataResult]);
-
-  async function handleAnalyzeData() {
-    if (!selectedDataFile || !dataPrompt.trim()) return;
-    onSetBusy('analysis-data');
-    setDataResult(null);
     try {
-      const data = await studioApi.analyzeData(selectedDataFile, dataPrompt);
-      setDataResult(data);
+      const history = chatHistories[tool];
+      const data = await chatApi.send(tool, message, history, context);
+      const assistantMsg = data.message;
+      setChatHistories((prev) => ({
+        ...prev,
+        [tool]: [...prev[tool].filter((m) => m.id !== optimisticUser.id), optimisticUser, assistantMsg],
+      }));
       await onRefreshWorkspace();
-      onSetMessage('数据分析已完成，图表已保存到 figures。');
+      onSetMessage('AI 回复已生成。');
     } catch (error) {
+      setChatHistories((prev) => ({
+        ...prev,
+        [tool]: prev[tool].filter((m) => m.id !== optimisticUser.id),
+      }));
       onSetMessage(error.message);
     } finally {
-      onSetBusy('');
+      setChatBusy('');
     }
   }
 
-  async function handleAnalyzeLiterature() {
-    if (!literatureQuery.trim()) return;
-    onSetBusy('literature-analyze');
-    setLiteratureResult(null);
+  async function handleClear(tool) {
     try {
-      const data = await studioApi.analyzeLiterature(literatureQuery);
-      setLiteratureResult(data);
-      onSetMessage('资料分析已完成。');
+      await chatApi.clear(tool);
+      setChatHistories((prev) => ({ ...prev, [tool]: [] }));
+      onSetMessage(`${tool} 对话已清空。`);
     } catch (error) {
       onSetMessage(error.message);
-    } finally {
-      onSetBusy('');
-    }
-  }
-
-  async function handleImportLiterature(downloadOriginal) {
-    if (!literatureResult?.cache_id) return;
-    onSetBusy(downloadOriginal ? 'literature-download' : 'literature-import');
-    try {
-      const data = await studioApi.importLiterature(literatureResult.cache_id, downloadOriginal);
-      await onRefreshWorkspace();
-      onSetMessage(downloadOriginal ? `已下载并导入：${data.source.filename}` : `已导入文献摘要：${data.source.filename}`);
-    } catch (error) {
-      onSetMessage(error.message);
-    } finally {
-      onSetBusy('');
-    }
-  }
-
-  async function handleInsertFigure() {
-    const analysis = dataResult?.analysis || null;
-    if (!analysis?.figure_relative_path) return;
-    onSetBusy('analysis-insert');
-    try {
-      await studioApi.insertDataFigure({
-        figure_relative_path: analysis.figure_relative_path,
-        figure_title: insertForm.figure_title,
-        figure_caption: insertForm.figure_caption,
-        figure_alt_text: insertForm.figure_alt_text,
-        section_title: insertForm.section_title,
-        introduction: insertForm.introduction,
-      });
-      await onRefreshWorkspace();
-      onSetMessage(`图表已插入到 ${insertForm.section_title || '当前文稿'}。`);
-    } catch (error) {
-      onSetMessage(error.message);
-    } finally {
-      onSetBusy('');
-    }
-  }
-
-  async function handleCreateMindmap() {
-    if (!mindmapPrompt.trim()) return;
-    onSetBusy('analysis-mindmap');
-    setMindmapResult(null);
-    try {
-      const data = await studioApi.createMindmap(mindmapPrompt);
-      setMindmapResult(data);
-      await onRefreshWorkspace();
-      onSetMessage('思维导图已生成并保存。');
-    } catch (error) {
-      onSetMessage(error.message);
-    } finally {
-      onSetBusy('');
-    }
-  }
-
-  async function handleCreateBrief() {
-    if (!briefPrompt.trim()) return;
-    onSetBusy('analysis-brief');
-    setBriefResult(null);
-    try {
-      const data = await studioApi.createBrief({
-        prompt: briefPrompt,
-        format: briefFormat,
-        scope_heading: briefScopeHeading || undefined,
-      });
-      setBriefResult(data);
-      await onRefreshWorkspace();
-      onSetMessage('展示摘要已生成并保存。');
-    } catch (error) {
-      onSetMessage(error.message);
-    } finally {
-      onSetBusy('');
     }
   }
 
   const activeManuscriptName = project?.active_manuscript?.split('/').pop() || 'No manuscript';
-  const dataAnalysis = dataResult?.analysis || null;
-  const mindmap = mindmapResult?.mindmap || null;
-  const brief = briefResult?.brief || null;
-  const selectedDataFileName = baseName(selectedDataFile) || 'Choose a data file';
-  const briefScopeLabel = briefScopeHeading || 'Whole manuscript';
+
   const toolOptions = [
-    {
-      id: 'literature',
-      label: 'Literature',
-      hint: '资料检索 + 结构判断',
-      icon: BookText,
-      title: 'Literature fit and source capture',
-      description: '先判断文献值不值得纳入当前论文结构，再决定是否导入到 sources，避免把分析和收藏混在一起。',
-      focus: literatureResult?.analysis?.title || 'Title / DOI / URL lookup',
-      supporting: `Current manuscript: ${activeManuscriptName}`,
-    },
-    {
-      id: 'data',
-      label: 'Data Analysis',
-      hint: '图表生成 + 文中插入',
-      icon: Database,
-      title: 'Data analysis and figure insertion',
-      description: '围绕当前项目数据集生成图表、解释结果，并直接准备标题、caption 和插入段落。',
-      focus: selectedDataFileName,
-      supporting: `${figureFiles.length} generated figure${figureFiles.length === 1 ? '' : 's'} in project`,
-    },
-    {
-      id: 'mindmap',
-      label: 'Mindmap',
-      hint: 'Mermaid 理论图谱',
-      icon: Sparkles,
-      title: 'Theory and framework mapping',
-      description: '根据 prompt 和稿件结构生成 Mermaid 思维导图，适合整理理论、框架、变量关系与叙事逻辑。',
-      focus: mindmap?.title || `${outlineTitles.length} outline anchors available`,
-      supporting: 'Saved as reusable Quarto-ready output',
-    },
-    {
-      id: 'brief',
-      label: 'PPT / Poster Brief',
-      hint: '展示摘要 + key messages',
-      icon: FileText,
-      title: 'Presentation-ready briefs',
-      description: '把稿件或某个部分压缩成适合 PPT、poster 或 article summary 的要点表达，并保存到 outputs/briefs。',
-      focus: brief?.title || briefScopeLabel,
-      supporting: `Target format: ${briefFormat.toUpperCase()}`,
-    },
+    { id: 'literature', label: 'Literature', hint: '资料检索 + 结构判断', icon: BookText },
+    { id: 'data', label: 'Data Analysis', hint: '图表生成 + 文中插入', icon: Database },
+    { id: 'mindmap', label: 'Mindmap', hint: 'Mermaid 理论图谱', icon: Sparkles },
+    { id: 'brief', label: 'PPT / Poster Brief', hint: '展示摘要 + key messages', icon: FileText },
   ];
-  const activeToolMeta = toolOptions.find((item) => item.id === activeTool) || toolOptions[0];
+
+  function renderResult(tool) {
+    return (msg) => {
+      if (tool === 'mindmap') return <MindmapResult msg={msg} />;
+      if (tool === 'brief') return <BriefResult msg={msg} />;
+      if (tool === 'data') return (
+        <DataResult
+          msg={msg}
+          outlineTitles={outlineTitles}
+          onRefreshWorkspace={onRefreshWorkspace}
+          onSetMessage={onSetMessage}
+          isBusy={isBusy || chatBusy === 'data'}
+          onSetBusy={onSetBusy}
+        />
+      );
+      if (tool === 'literature') return (
+        <LiteratureResult
+          msg={msg}
+          onRefreshWorkspace={onRefreshWorkspace}
+          onSetMessage={onSetMessage}
+          isBusy={isBusy || chatBusy === 'literature'}
+          onSetBusy={onSetBusy}
+        />
+      );
+      return null;
+    };
+  }
+
+  function contextSlot(tool) {
+    if (tool === 'data') return (
+      <>
+        <select
+          disabled={isBusy || chatBusy === 'data' || dataFiles.length === 0}
+          onChange={(e) => setSelectedDataFile(e.target.value)}
+          value={selectedDataFile}
+          style={{ flex: 1 }}
+        >
+          {dataFiles.length === 0 && <option value="">No data files</option>}
+          {dataFiles.map((f) => <option key={f.relative_path} value={f.relative_path}>{f.name}</option>)}
+        </select>
+        {inlinePreviewFile && <FilePreview compact file={inlinePreviewFile} />}
+      </>
+    );
+    if (tool === 'brief') return (
+      <>
+        <select
+          disabled={isBusy || chatBusy === 'brief'}
+          onChange={(e) => setBriefFormat(e.target.value)}
+          value={briefFormat}
+        >
+          <option value="ppt">PPT</option>
+          <option value="poster">Poster</option>
+          <option value="summary">Article Summary</option>
+          <option value="custom">Custom</option>
+        </select>
+        <select
+          disabled={isBusy || chatBusy === 'brief'}
+          onChange={(e) => setBriefScopeHeading(e.target.value)}
+          value={briefScopeHeading}
+        >
+          <option value="">Whole Manuscript</option>
+          {outlineTitles.map((t) => <option key={t} value={t}>{t}</option>)}
+        </select>
+      </>
+    );
+    return null;
+  }
 
   return (
     <section className="analysis-shell" style={{ '--sidebar-w': `${sidebarWidth}px` }}>
@@ -310,12 +435,10 @@ export function AnalysisWorkspace({
             <span>Current Manuscript</span>
           </div>
           <strong>{activeManuscriptName}</strong>
-          <p>{outlineTitles.length > 0 ? '下面这些标题可以直接作为图表插入位置、brief scope 或 mindmap 的锚点。' : '当前文稿还没有可识别的标题结构。'}</p>
+          <p>{outlineTitles.length > 0 ? '标题可用作图表位置、brief scope 或 mindmap 锚点。' : '当前文稿还没有可识别的标题。'}</p>
           {outlinePreview.length > 0 ? (
             <div className="analysis-outline-preview">
-              {outlinePreview.map((title, index) => (
-                <span key={`${title}-${index}`}>{title}</span>
-              ))}
+              {outlinePreview.map((title, i) => <span key={`${title}-${i}`}>{title}</span>)}
             </div>
           ) : (
             <p className="empty-line">No outline detected</p>
@@ -335,7 +458,7 @@ export function AnalysisWorkspace({
               {dataFiles.map((file) => (
                 <button
                   className={`analysis-file-button ${selectedDataFile === file.relative_path ? 'active' : ''}`}
-                  disabled={isBusy}
+                  disabled={isBusy || chatBusy !== ''}
                   key={file.relative_path}
                   onClick={() => setSelectedDataFile(file.relative_path)}
                   type="button"
@@ -355,39 +478,33 @@ export function AnalysisWorkspace({
             <Image size={16} />
             <span>Generated Figures</span>
           </div>
-          <PreviewList items={figureFiles} />
+          {figureFiles.length === 0
+            ? <p className="empty-line">No figures yet</p>
+            : figureFiles.map((f) => (
+              <div className="analysis-sidebar-item" key={f.relative_path}>
+                <strong>{f.name}</strong>
+                <span>{f.size_label}</span>
+              </div>
+            ))
+          }
         </section>
       </aside>
 
       <div className="analysis-resize-handle" onMouseDown={startResize} />
 
       <section className="analysis-main">
-        <header className="analysis-hero">
-          <div className="analysis-hero-copy">
-            <span className="analysis-eyebrow">{activeToolMeta.label}</span>
-            <h2>{activeToolMeta.title}</h2>
-          </div>
-          <div className="analysis-hero-focus">
-            <span>Current focus</span>
-            <strong>{activeToolMeta.focus}</strong>
-            <p>{activeToolMeta.supporting}</p>
-          </div>
-        </header>
-
         <div className="analysis-tool-switcher">
           {toolOptions.map((tool) => {
             const Icon = tool.icon;
             return (
               <button
                 className={activeTool === tool.id ? 'active' : ''}
-                disabled={isBusy}
+                disabled={isBusy || (chatBusy !== '' && chatBusy !== tool.id)}
                 key={tool.id}
                 onClick={() => setActiveTool(tool.id)}
                 type="button"
               >
-                <div className="analysis-tool-icon">
-                  <Icon size={16} />
-                </div>
+                <div className="analysis-tool-icon"><Icon size={16} /></div>
                 <div className="analysis-tool-copy">
                   <strong>{tool.label}</strong>
                   <small>{tool.hint}</small>
@@ -397,311 +514,24 @@ export function AnalysisWorkspace({
           })}
         </div>
 
-        {activeTool === 'literature' && (
-          <section className="analysis-panel">
-            <LiteraturePanel
-              isBusy={isBusy}
-              literatureQuery={literatureQuery}
-              literatureResult={literatureResult}
-              onAnalyze={handleAnalyzeLiterature}
-              onImport={handleImportLiterature}
-              outlineTitles={outlineTitles}
-              setLiteratureQuery={setLiteratureQuery}
-            />
-          </section>
-        )}
-
-        {activeTool === 'data' && (
-          <section className="analysis-panel">
-            <div className="analysis-grid-2">
-              <section className="analysis-section-card">
-                <div className="analysis-section-head">
-                  <span>Prompt</span>
-                  <strong>{selectedDataFileName}</strong>
-                </div>
-                <div className="analysis-form-row">
-                  <select
-                    disabled={isBusy || dataFiles.length === 0}
-                    onChange={(event) => setSelectedDataFile(event.target.value)}
-                    value={selectedDataFile}
-                  >
-                    {dataFiles.map((file) => (
-                      <option key={file.relative_path} value={file.relative_path}>
-                        {file.name}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    className="primary"
-                    disabled={isBusy || !selectedDataFile || !dataPrompt.trim()}
-                    onClick={handleAnalyzeData}
-                    type="button"
-                  >
-                    分析并绘图
-                  </button>
-                </div>
-                {inlinePreviewFile && (
-                  <FilePreview compact file={inlinePreviewFile} />
-                )}
-                <textarea
-                  className="analysis-prompt"
-                  onChange={(event) => setDataPrompt(event.target.value)}
-                  placeholder="例如：比较不同国家合作类型的分布，并生成一张适合放在 Results 部分的图。"
-                  value={dataPrompt}
-                />
-                <p className="analysis-inline-note">建议在 prompt 里明确变量、比较维度、预期图形，以及你想放进文稿的章节位置。</p>
-
-                {dataAnalysis ? (
-                  <div className="analysis-result-card">
-                    <strong>{dataAnalysis.figure_title}</strong>
-                    <p className="analysis-meta">
-                      {dataAnalysis.data_file} · {dataAnalysis.chart_type} · {dataAnalysis.aggregation}
-                    </p>
-                    <p>{dataAnalysis.summary}</p>
-                    {dataAnalysis.key_points?.length > 0 && (
-                      <div className="analysis-subcard">
-                        <span>Key Points</span>
-                        <ul className="analysis-result-list">
-                          {dataAnalysis.key_points.map((item, index) => <li key={index}>{item}</li>)}
-                        </ul>
-                      </div>
-                    )}
-                    {dataAnalysis.execution_notes?.length > 0 && (
-                      <div className="analysis-subcard">
-                        <span>Execution Notes</span>
-                        <ul className="analysis-result-list">
-                          {dataAnalysis.execution_notes.map((item, index) => <li key={index}>{item}</li>)}
-                        </ul>
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <AnalysisPlaceholder
-                    title="Run analysis"
-                    copy="完成后这里会生成图表摘要、关键发现和执行说明，方便你先判断是否值得插入文稿。"
-                  />
-                )}
-              </section>
-
-              <section className="analysis-section-card">
-                <div className="analysis-section-head">
-                  <span>Figure and insertion</span>
-                  <strong>{dataAnalysis ? 'Ready to place' : 'Awaiting output'}</strong>
-                </div>
-                {dataAnalysis ? (
-                  <>
-                    <div className="analysis-figure-frame">
-                      <img
-                        alt={dataAnalysis.figure_alt_text || dataAnalysis.figure_title}
-                        className="analysis-figure-preview"
-                        src={buildProjectFileUrl(dataAnalysis.figure_relative_path)}
-                      />
-                    </div>
-                    <div className="analysis-subcard analysis-insert-card">
-                      <span>Insertion Draft</span>
-                      <div className="analysis-insert-grid">
-                        <label>
-                          插入位置
-                          <input
-                            list="analysis-section-options"
-                            onChange={(event) => setInsertForm((current) => ({ ...current, section_title: event.target.value }))}
-                            value={insertForm.section_title}
-                          />
-                          <datalist id="analysis-section-options">
-                            {outlineTitles.map((title) => <option key={title} value={title} />)}
-                          </datalist>
-                        </label>
-                        <label>
-                          图表标题
-                          <input
-                            onChange={(event) => setInsertForm((current) => ({ ...current, figure_title: event.target.value }))}
-                            value={insertForm.figure_title}
-                          />
-                        </label>
-                        <label className="analysis-span-2">
-                          Caption
-                          <textarea
-                            onChange={(event) => setInsertForm((current) => ({ ...current, figure_caption: event.target.value }))}
-                            value={insertForm.figure_caption}
-                          />
-                        </label>
-                        <label className="analysis-span-2">
-                          引入段落
-                          <textarea
-                            onChange={(event) => setInsertForm((current) => ({ ...current, introduction: event.target.value }))}
-                            value={insertForm.introduction}
-                          />
-                        </label>
-                        <label className="analysis-span-2">
-                          Alt Text
-                          <input
-                            onChange={(event) => setInsertForm((current) => ({ ...current, figure_alt_text: event.target.value }))}
-                            value={insertForm.figure_alt_text}
-                          />
-                        </label>
-                      </div>
-                      <div className="analysis-actions">
-                        <button className="primary" disabled={isBusy} onClick={handleInsertFigure} type="button">
-                          插入到当前文稿
-                        </button>
-                        <span>{dataAnalysis.figure_relative_path}</span>
-                      </div>
-                    </div>
-                  </>
-                ) : (
-                  <AnalysisPlaceholder
-                    title="Preview will appear here"
-                    copy="图表会保存在 figures，同时自动生成标题、caption、alt text 和插入段落草稿。"
-                  />
-                )}
-              </section>
+        <div className="analysis-chat-area">
+          {toolOptions.map((tool) => (
+            <div
+              key={tool.id}
+              style={{ display: activeTool === tool.id ? 'flex' : 'none', flexDirection: 'column', height: '100%' }}
+            >
+              <ChatPanel
+                tool={tool.id}
+                messages={chatHistories[tool.id]}
+                isBusy={chatBusy === tool.id}
+                onSend={(message) => handleSend(tool.id, message)}
+                onClear={() => handleClear(tool.id)}
+                contextSlot={contextSlot(tool.id)}
+                renderResult={renderResult(tool.id)}
+              />
             </div>
-          </section>
-        )}
-
-        {activeTool === 'mindmap' && (
-          <section className="analysis-panel">
-            <div className="analysis-grid-2">
-              <section className="analysis-section-card">
-                <div className="analysis-section-head">
-                  <span>Prompt</span>
-                  <strong>{outlineTitles.length > 0 ? `${outlineTitles.length} outline anchors available` : 'Theory / framework prompt'}</strong>
-                </div>
-                <textarea
-                  className="analysis-prompt"
-                  onChange={(event) => setMindmapPrompt(event.target.value)}
-                  placeholder="例如：围绕 African higher education inequality 的理论框架画一张思维导图。"
-                  value={mindmapPrompt}
-                />
-                <div className="analysis-actions">
-                  <button className="primary" disabled={isBusy || !mindmapPrompt.trim()} onClick={handleCreateMindmap} type="button">
-                    生成思维导图
-                  </button>
-                </div>
-                {outlinePreview.length > 0 && (
-                  <>
-                    <span className="analysis-inline-label">Available sections</span>
-                    <div className="analysis-outline-preview">
-                      {outlinePreview.map((title, index) => (
-                        <span key={`${title}-${index}`}>{title}</span>
-                      ))}
-                    </div>
-                  </>
-                )}
-                <p className="analysis-inline-note">可以直接指定理论、framework、变量关系或某个章节，让导图更贴近你的论证结构。</p>
-              </section>
-
-              <section className="analysis-section-card">
-                <div className="analysis-section-head">
-                  <span>Rendered preview</span>
-                  <strong>{mindmap?.title || 'Awaiting diagram'}</strong>
-                </div>
-                {mindmap ? (
-                  <div className="analysis-result-card">
-                    <p>{mindmap.summary}</p>
-                    <div className="analysis-figure-frame">
-                      <MermaidPreview code={mindmap.mermaid} />
-                    </div>
-                    <details className="analysis-code-block">
-                      <summary>查看 Mermaid 代码 / Quarto Snippet</summary>
-                      <pre>{mindmap.quarto_block}</pre>
-                    </details>
-                    <div className="analysis-actions">
-                      <span>{mindmap.output_relative_path}</span>
-                    </div>
-                  </div>
-                ) : (
-                  <AnalysisPlaceholder
-                    title="Mindmap preview"
-                    copy="生成后这里会渲染 Mermaid 图，并提供可直接放进 qmd 的代码块。"
-                  />
-                )}
-              </section>
-            </div>
-          </section>
-        )}
-
-        {activeTool === 'brief' && (
-          <section className="analysis-panel">
-            <div className="analysis-grid-2">
-              <section className="analysis-section-card">
-                <div className="analysis-section-head">
-                  <span>Brief setup</span>
-                  <strong>{briefScopeLabel}</strong>
-                </div>
-                <div className="analysis-form-row">
-                  <select disabled={isBusy} onChange={(event) => setBriefFormat(event.target.value)} value={briefFormat}>
-                    <option value="ppt">PPT</option>
-                    <option value="poster">Poster</option>
-                    <option value="summary">Article Summary</option>
-                    <option value="custom">Custom</option>
-                  </select>
-                  <select disabled={isBusy} onChange={(event) => setBriefScopeHeading(event.target.value)} value={briefScopeHeading}>
-                    <option value="">Whole Manuscript</option>
-                    {outlineTitles.map((title) => (
-                      <option key={title} value={title}>{title}</option>
-                    ))}
-                  </select>
-                </div>
-                <textarea
-                  className="analysis-prompt"
-                  onChange={(event) => setBriefPrompt(event.target.value)}
-                  placeholder="例如：为 poster 生成一个清晰的问题意识、三条核心发现和一个 takeaway。"
-                  value={briefPrompt}
-                />
-                <div className="analysis-actions">
-                  <button className="primary" disabled={isBusy || !briefPrompt.trim()} onClick={handleCreateBrief} type="button">
-                    生成展示摘要
-                  </button>
-                </div>
-                <p className="analysis-inline-note">适合做 poster、conference PPT、摘要页，或者把单个章节压缩成更有展示性的表达。</p>
-              </section>
-
-              <section className="analysis-section-card">
-                <div className="analysis-section-head">
-                  <span>Output</span>
-                  <strong>{brief?.title || 'Awaiting brief'}</strong>
-                </div>
-                {brief ? (
-                  <div className="analysis-result-card">
-                    <p className="analysis-meta">{compactLine(brief.target_format)} · {compactLine(brief.focus)}</p>
-                    {brief.one_liner && (
-                      <div className="analysis-subcard">
-                        <span>One-liner</span>
-                        <p>{brief.one_liner}</p>
-                      </div>
-                    )}
-                    <p>{brief.summary}</p>
-                    {brief.key_messages?.length > 0 && (
-                      <div className="analysis-subcard">
-                        <span>Key Messages</span>
-                        <ul className="analysis-result-list">
-                          {brief.key_messages.map((item, index) => <li key={index}>{item}</li>)}
-                        </ul>
-                      </div>
-                    )}
-                    {brief.slide_outline?.length > 0 && (
-                      <div className="analysis-subcard">
-                        <span>Suggested Outline</span>
-                        <ul className="analysis-result-list">
-                          {brief.slide_outline.map((item, index) => <li key={index}>{item}</li>)}
-                        </ul>
-                      </div>
-                    )}
-                    <div className="analysis-actions">
-                      <span>{brief.output_relative_path}</span>
-                    </div>
-                  </div>
-                ) : (
-                  <AnalysisPlaceholder
-                    title="Brief output"
-                    copy="生成后这里会展示 one-liner、核心信息和建议结构，适合直接转成展示页。"
-                  />
-                )}
-              </section>
-            </div>
-          </section>
-        )}
+          ))}
+        </div>
       </section>
     </section>
   );
