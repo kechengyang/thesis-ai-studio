@@ -12,7 +12,7 @@ import {
   X,
 } from 'lucide-react';
 
-const API = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8001/api';
+const API = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8011/api';
 
 async function request(path, options = {}) {
   const response = await fetch(`${API}${path}`, options);
