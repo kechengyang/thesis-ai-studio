@@ -124,7 +124,7 @@ h1 {
 
 .workspace-mode-switcher button {
   background: transparent;
-  border-color: transparent;
+  border: 1px solid transparent;
   font-size: 13px;
   font-weight: 500;
   min-height: 34px;
@@ -133,8 +133,7 @@ h1 {
 
 .workspace-mode-switcher button.active {
   background: #ffffff;
-  border-color: #b8ccbb;
-  border-width: 1.5px;
+  border: 1.5px solid #b8ccbb;
   box-shadow: 0 1px 4px rgba(27, 36, 31, 0.10);
   font-weight: 700;
 }
@@ -528,12 +527,9 @@ h1 {
 }
 
 .literature-panel {
-  background: #f7f5ef;
-  border: 1px solid #e4ddd1;
-  border-radius: 8px;
   display: grid;
-  gap: 10px;
-  padding: 10px;
+  gap: 12px;
+  min-height: 0;
 }
 
 .literature-copy {
@@ -556,12 +552,8 @@ h1 {
 }
 
 .literature-result {
-  background: #fffdfa;
-  border: 1px solid #e7dfd2;
-  border-radius: 7px;
   display: grid;
-  gap: 7px;
-  padding: 10px;
+  gap: 8px;
 }
 
 .literature-result strong {
@@ -637,8 +629,10 @@ h1 {
 }
 
 .analysis-sidebar {
+  align-content: start;
   display: grid;
   gap: 12px;
+  overflow-y: auto;
 }
 
 .analysis-sidebar-card,
@@ -703,7 +697,7 @@ h1 {
 .analysis-main {
   display: grid;
   gap: 12px;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: auto auto 1fr;
 }
 
 .analysis-tool-switcher {
