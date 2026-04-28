@@ -10,6 +10,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -1108,7 +1109,7 @@ def log_ai_suggestion(
         "instruction": req.instruction,
         "selected_text": excerpt(req.selected_text),
         "suggestion": suggestion,
-        "source_files": sorted({source["filename"] for source in sources}),
+        "source_files": sorted({str(source.get("filename", "")) for source in sources if source.get("filename")}),
         "raw_excerpt": excerpt(raw_text, limit=900),
         "status": "proposed",
     }
@@ -1193,7 +1194,43 @@ def chunks(text: str, size: int = 1200) -> list[str]:
     return [clean[i : i + size] for i in range(0, len(clean), size) if clean[i : i + size].strip()]
 
 
-def search_sources(query: str, limit: int = 5) -> list[dict[str, str]]:
+def sanitize_source_url(value: str) -> str:
+    text = str(value or "").strip()
+    if not re.match(r"^https?://", text, flags=re.IGNORECASE):
+        return text
+    parsed = urlparse(text)
+    clean_query = urlencode(
+        [
+            (key, val)
+            for key, val in parse_qsl(parsed.query, keep_blank_values=True)
+            if not key.lower().startswith("utm_")
+        ]
+    )
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, clean_query, ""))
+
+
+def source_credibility(url: str, filename: str = "") -> tuple[str, str]:
+    host = urlparse(str(url or "")).netloc.lower()
+    name = str(filename or "").lower()
+    if "wikipedia.org" in host:
+        return "background", "background_only"
+    if "openalex.org" in host or "doi.org" in host or "journals.sagepub.com" in host:
+        return "scholarly", "high"
+    if host.endswith(".go.ke") or host.endswith(".gov") or "vision2030.go.ke" in host:
+        return "policy_or_official", "high"
+    if name.endswith(".pdf") or host.endswith(".edu") or host.endswith(".ac.ke") or host.endswith(".or.ke"):
+        return "institutional_or_report", "medium"
+    if host:
+        return "external_web", "medium"
+    return "project_source", "project"
+
+
+def source_title_from_entry(entry: dict[str, Any]) -> str:
+    filename = str(entry.get("filename") or entry.get("text_file") or "Project source").strip()
+    return re.sub(r"[_-]+", " ", Path(filename).stem).strip() or filename
+
+
+def search_sources(query: str, limit: int = 5) -> list[dict[str, Any]]:
     project = workspace_path()
     terms = [term.lower() for term in re.findall(r"[\w\-]{2,}", query)]
     scored = []
@@ -1207,9 +1244,124 @@ def search_sources(query: str, limit: int = 5) -> list[dict[str, str]]:
             if not terms and query[:12] in chunk:
                 score = 1
             if score > 0:
-                scored.append((score, item["filename"], chunk))
+                source_url = sanitize_source_url(str(item.get("source_url", "") or ""))
+                source_type, credibility = source_credibility(source_url, item.get("filename", ""))
+                scored.append(
+                    (
+                        score,
+                        {
+                            "filename": item.get("filename", text_path.name),
+                            "text_file": item.get("text_file", text_path.name),
+                            "title": source_title_from_entry(item),
+                            "url": source_url,
+                            "source_type": source_type,
+                            "credibility": credibility,
+                            "text": chunk,
+                            "snippet": excerpt(chunk, limit=520),
+                        },
+                    )
+                )
     scored.sort(key=lambda row: row[0], reverse=True)
-    return [{"filename": filename, "text": text} for _, filename, text in scored[:limit]]
+    return [item for _, item in scored[:limit]]
+
+
+def candidate_source_reference(candidate: dict[str, Any], index: int) -> dict[str, str]:
+    url = sanitize_source_url(str(candidate.get("source_url") or candidate.get("doi") or candidate.get("openalex_id") or ""))
+    source_type, credibility = source_credibility(url, str(candidate.get("title", "")))
+    authors = candidate.get("authors") if isinstance(candidate.get("authors"), list) else []
+    meta = ", ".join(str(author) for author in authors[:4] if str(author).strip())
+    if candidate.get("year"):
+        meta = f"{meta} ({candidate.get('year')})" if meta else str(candidate.get("year"))
+    return {
+        "id": str(index),
+        "title": str(candidate.get("title") or f"External source {index}").strip(),
+        "url": url,
+        "source_type": source_type,
+        "credibility": credibility,
+        "used_for": "External literature or evidence candidate for this writing turn.",
+        "snippet": excerpt(str(candidate.get("abstract") or candidate.get("excerpt") or meta or ""), limit=520),
+        "filename": "",
+        "text_file": "",
+    }
+
+
+def local_source_reference(source: dict[str, Any], index: int) -> dict[str, str]:
+    return {
+        "id": str(index),
+        "title": str(source.get("title") or source.get("filename") or f"Project source {index}").strip(),
+        "url": sanitize_source_url(str(source.get("url") or source.get("source_url") or "")),
+        "source_type": str(source.get("source_type") or "project_source"),
+        "credibility": str(source.get("credibility") or "project"),
+        "used_for": "Local project source excerpt relevant to this writing turn.",
+        "snippet": excerpt(str(source.get("snippet") or source.get("text") or ""), limit=520),
+        "filename": str(source.get("filename") or ""),
+        "text_file": str(source.get("text_file") or ""),
+    }
+
+
+def available_editor_source_references(
+    source_hits: list[dict[str, Any]],
+    tool_results: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    references: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for source in source_hits:
+        key = str(source.get("url") or source.get("text_file") or source.get("filename") or str(source.get("text") or "")[:80])
+        if key in seen:
+            continue
+        seen.add(key)
+        references.append(local_source_reference(source, len(references) + 1))
+
+    for result in tool_results:
+        if result.get("type") != "search_literature" or result.get("status") == "error":
+            continue
+        for ref in result.get("source_references", []):
+            key = str(ref.get("url") or ref.get("title") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            next_ref = dict(ref)
+            next_ref["id"] = str(len(references) + 1)
+            references.append(next_ref)
+
+    return references
+
+
+def merge_source_references(
+    parsed_references: list[dict[str, Any]],
+    available_references: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    merged: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for ref in [*parsed_references, *available_references]:
+        url = sanitize_source_url(str(ref.get("url") or ref.get("source_url") or ""))
+        title = str(ref.get("title") or ref.get("filename") or "").strip()
+        text_file = str(ref.get("text_file") or "").strip()
+        filename = str(ref.get("filename") or "").strip()
+        if not url and title and not text_file and not filename:
+            url = build_google_scholar_search_url(title)
+        key = url or title.lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(
+            {
+                "id": str(ref.get("id") or len(merged) + 1).strip("[]") or str(len(merged) + 1),
+                "title": title or f"Source {len(merged) + 1}",
+                "url": url,
+                "source_type": str(ref.get("source_type") or ref.get("type") or ""),
+                "credibility": str(ref.get("credibility") or ""),
+                "used_for": str(ref.get("used_for") or ""),
+                "snippet": excerpt(str(ref.get("snippet") or ref.get("text") or ""), limit=520),
+                "filename": filename,
+                "text_file": text_file,
+            }
+        )
+    for index, ref in enumerate(merged, start=1):
+        ref["id"] = str(index)
+    return merged
 
 
 def read_source_entry(project: Path, filename: str = "", text_file: str = "") -> dict[str, Any] | None:
@@ -1273,7 +1425,21 @@ def focused_source_hits(project: Path, source_entry: dict[str, Any] | None, quer
     selected = candidates[:limit] if candidates else []
     if not selected:
         selected = [(1, chunk) for chunk in chunks(text_path.read_text(encoding="utf-8", errors="ignore"), size=1200)[:limit]]
-    return [{"filename": source_entry.get("filename", text_file), "text": text} for _, text in selected[:limit]]
+    source_url = sanitize_source_url(str(source_entry.get("source_url", "") or ""))
+    source_type, credibility = source_credibility(source_url, source_entry.get("filename", ""))
+    return [
+        {
+            "filename": source_entry.get("filename", text_file),
+            "text_file": text_file,
+            "title": source_title_from_entry(source_entry),
+            "url": source_url,
+            "source_type": source_type,
+            "credibility": credibility,
+            "text": text,
+            "snippet": excerpt(text, limit=520),
+        }
+        for _, text in selected[:limit]
+    ]
 
 
 def build_literature_chat_context(req: ChatRequest, project: Path) -> dict[str, Any]:
@@ -1442,6 +1608,43 @@ def manuscript_section_snapshots(document: str, per_section_limit: int = 420, ma
     return snapshots[:max_sections]
 
 
+def user_requested_local_sources(message: str) -> bool:
+    text = str(message or "").lower()
+    return bool(
+        re.search(
+            r"(本地|项目资料|已导入|导入的|上传的|当前资料|local source|project source|imported source|uploaded source|use local|use project|sources?/)",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def editor_message_needs_external_sources(message: str) -> bool:
+    text = str(message or "")
+    return bool(
+        re.search(
+            r"(证据|引用|来源|外部|链接|文献|数据支撑|实证|统计|政策|bibliometric|citation|citations|source|sources|evidence|empirical|literature|policy|statistics|links?|doi)",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def ensure_external_search_action(message: str, tool_actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if user_requested_local_sources(message) or not editor_message_needs_external_sources(message):
+        return tool_actions
+    if any(action.get("type") in {"search_literature", "import_literature"} for action in tool_actions):
+        return tool_actions
+    return [
+        {
+            "type": "search_literature",
+            "reason": "Default external lookup for evidence, citations, sources, or empirical support.",
+            "query": excerpt(message, limit=240),
+        },
+        *tool_actions,
+    ]
+
+
 def build_editor_chat_context(req: ChatRequest, project: Path) -> tuple[dict[str, Any], list[dict[str, str]]]:
     document = str(req.context.get("document", "") or paper_path().read_text(encoding="utf-8"))
     selected_text = str(req.context.get("selected_text", "")).strip()
@@ -1459,12 +1662,17 @@ def build_editor_chat_context(req: ChatRequest, project: Path) -> tuple[dict[str
             item["selected_text"] = excerpt(effective_selected_text, limit=600)
         if msg.result:
             rewritten = str(msg.result.get("rewritten_text", "")).strip()
+            answer_markdown = str(msg.result.get("answer_markdown", "")).strip()
             rationale = str(msg.result.get("rationale", "")).strip()
             tool_results = msg.result.get("tool_results") if isinstance(msg.result.get("tool_results"), list) else []
             if rewritten:
                 item["rewritten_text"] = excerpt(rewritten, limit=1200)
+            if answer_markdown:
+                item["answer_markdown"] = excerpt(answer_markdown, limit=1200)
             if rationale:
                 item["rationale"] = rationale
+            if isinstance(msg.result.get("source_references"), list) and msg.result.get("source_references"):
+                item["source_references"] = msg.result.get("source_references")[:5]
             if tool_results:
                 item["tool_results"] = [
                     {
@@ -1495,6 +1703,12 @@ def build_editor_chat_context(req: ChatRequest, project: Path) -> tuple[dict[str
             "project_asset_inventory": build_editor_asset_inventory(project),
             "paper_outline": outline_from_document(document),
             "local_sources": source_hits,
+            "available_source_references": available_editor_source_references(source_hits, []),
+            "source_policy": (
+                "Prefer local/project/imported sources because the user explicitly requested them."
+                if user_requested_local_sources(req.message)
+                else "Prefer external web/literature lookup first for evidence and citation requests; use local sources only as secondary context unless the user names them."
+            ),
             "project_memory": build_memory_context(project),
             "recent_editor_turns": recent_turns,
         },
@@ -1527,6 +1741,28 @@ def execute_editor_tool_actions(
             "status": "ok",
         }
         try:
+            if action_type == "search_literature":
+                query = str(action.get("query", "")).strip()
+                bundle = search_literature_candidates(query)
+                candidates = bundle.get("search_results", []) or ([bundle.get("candidate")] if bundle.get("candidate") else [])
+                source_references = [
+                    candidate_source_reference(candidate, index)
+                    for index, candidate in enumerate(candidates[:5], start=1)
+                    if isinstance(candidate, dict)
+                ]
+                results.append(
+                    {
+                        **base_result,
+                        "query": query,
+                        "candidate_title": (bundle.get("candidate") or {}).get("title", ""),
+                        "query_kind": bundle.get("query_kind", "query"),
+                        "scholar_search_url": sanitize_source_url(bundle.get("scholar_search_url", "")),
+                        "source_references": source_references,
+                        "summary": "Found external literature candidates for evidence-oriented writing support.",
+                    }
+                )
+                continue
+
             if action_type == "import_literature":
                 query = str(action.get("query", "")).strip()
                 bundle = search_literature_candidates(query)
@@ -1675,7 +1911,7 @@ def build_ai_trace(settings: dict[str, Any], source_hits: list[dict[str, str]], 
         "model": settings.get("model", ""),
         "reasoning_effort": settings.get("reasoning", ""),
         "source_count": len(source_hits),
-        "source_files": sorted({source["filename"] for source in source_hits}),
+        "source_files": sorted({str(source.get("filename", "")) for source in source_hits if source.get("filename")}),
         "memory_summary_used": bool(memory_context.get("summary")),
         "recent_ai_interactions_used": len(memory_context.get("recent_ai_interactions", [])),
         "recent_edits_used": len(memory_context.get("recent_accepted_or_rejected_edits", [])),
@@ -1810,29 +2046,33 @@ def run_chat_turn(
         planner_messages = build_chat_messages(history_dicts, req.message, json.dumps(context_payload, ensure_ascii=False))
         planner_raw = provider.generate_chat_json(settings, editor_tool_planner_instructions(settings), planner_messages)
         tool_plan = parse_editor_tool_plan_json(planner_raw)
+        tool_actions = ensure_external_search_action(req.message, tool_plan.get("tool_actions", []))
         tool_results = execute_editor_tool_actions(
             project,
             provider,
             settings,
-            tool_plan.get("tool_actions", []),
+            tool_actions,
             req.message,
             document,
             outline,
         )
         if tool_results:
             context_payload, source_hits = build_editor_chat_context(req, project)
+        available_source_references = available_editor_source_references(source_hits, tool_results)
         final_context = {
             **context_payload,
             "executed_tool_results": tool_results,
-            "requested_tool_actions": tool_plan.get("tool_actions", []),
+            "requested_tool_actions": tool_actions,
             "tool_planner_reason": tool_plan.get("reason", ""),
+            "available_source_references": available_source_references,
         }
         final_messages = build_chat_messages(history_dicts, req.message, json.dumps(final_context, ensure_ascii=False))
         raw_text = provider.generate_chat_json(settings, editor_chat_instructions(settings), final_messages)
         parsed = parse_editor_chat_json(raw_text)
+        parsed["source_references"] = merge_source_references(parsed.get("source_references", []), available_source_references)
         selected_text = str(req.context.get("selected_text", "")).strip() or str(parsed.get("selected_text", "")).strip()
         parsed["selected_text"] = selected_text
-        parsed["tool_actions"] = tool_plan.get("tool_actions", [])
+        parsed["tool_actions"] = tool_actions
         parsed["tool_results"] = tool_results
         has_actionable_operations = bool(parsed.get("operations"))
         has_tool_side_effects = bool(tool_results)
@@ -1850,6 +2090,10 @@ def run_chat_turn(
                         "selected_text": selected_text,
                         "rewritten_text": parsed.get("rewritten_text", ""),
                         "operations": parsed.get("operations", []),
+                        "answer_markdown": parsed.get("answer_markdown", ""),
+                        "article_suggestions": parsed.get("article_suggestions", []),
+                        "evidence_sections": parsed.get("evidence_sections", []),
+                        "source_references": parsed.get("source_references", []),
                         "tool_actions": parsed.get("tool_actions", []),
                         "tool_results": parsed.get("tool_results", []),
                         "rationale": parsed.get("rationale", ""),
@@ -1858,7 +2102,7 @@ def run_chat_turn(
                         "citation_or_data_notes": parsed.get("citation_or_data_notes", []),
                         "confidence": parsed.get("confidence", "medium"),
                     },
-                    "source_files": sorted({source["filename"] for source in source_hits}),
+                    "source_files": sorted({str(source.get("filename", "")) for source in source_hits if source.get("filename")}),
                     "raw_excerpt": excerpt(raw_text, limit=900),
                     "status": "proposed",
                     "chat_mode": True,

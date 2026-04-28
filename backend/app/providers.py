@@ -38,6 +38,55 @@ def normalize_text_list(value: Any) -> list[str]:
     return [text] if text else []
 
 
+def normalize_structured_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    items: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, dict):
+            cleaned = {
+                str(key): val
+                for key, val in item.items()
+                if val is not None and str(val).strip()
+            }
+            if cleaned:
+                items.append(cleaned)
+            continue
+        text = str(item).strip()
+        if text:
+            items.append({"text": text})
+    return items
+
+
+def normalize_source_references(value: Any) -> list[dict[str, str]]:
+    references: list[dict[str, str]] = []
+    for index, item in enumerate(normalize_structured_list(value), start=1):
+        source_id = str(item.get("id") or item.get("label") or index).strip()
+        source_id = source_id.strip("[]") or str(index)
+        title = str(item.get("title") or item.get("filename") or item.get("name") or f"Source {source_id}").strip()
+        url = str(item.get("url") or item.get("source_url") or item.get("href") or "").strip()
+        source_type = str(item.get("source_type") or item.get("type") or "").strip()
+        credibility = str(item.get("credibility") or item.get("quality") or "").strip()
+        used_for = str(item.get("used_for") or item.get("use") or item.get("claim") or "").strip()
+        snippet = str(item.get("snippet") or item.get("excerpt") or item.get("text") or "").strip()
+        text_file = str(item.get("text_file") or "").strip()
+        filename = str(item.get("filename") or "").strip()
+        references.append(
+            {
+                "id": source_id,
+                "title": title,
+                "url": url,
+                "source_type": source_type,
+                "credibility": credibility,
+                "used_for": used_for,
+                "snippet": snippet,
+                "text_file": text_file,
+                "filename": filename,
+            }
+        )
+    return references
+
+
 def normalize_editor_operations(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -159,6 +208,18 @@ def normalize_editor_tool_actions(value: Any) -> list[dict[str, Any]]:
                 )
             continue
 
+        if action_type in {"search_literature", "external_literature", "find_sources", "source_search"}:
+            query = str(item.get("query") or item.get("title") or item.get("input") or "").strip()
+            if query:
+                actions.append(
+                    {
+                        "type": "search_literature",
+                        "reason": reason,
+                        "query": query,
+                    }
+                )
+            continue
+
         if action_type in {"create_data_figure", "data_figure", "analyze_data"}:
             data_relative_path = str(
                 item.get("data_relative_path")
@@ -248,6 +309,12 @@ def normalize_editor_chat(payload: Any) -> dict[str, Any]:
         payload = {"content": str(payload).strip()}
     suggestion = normalize_suggestion(payload)
     content = str(payload.get("content", "")).strip()
+    answer_markdown = str(
+        payload.get("answer_markdown")
+        or payload.get("answer")
+        or payload.get("markdown")
+        or "",
+    ).strip()
     operations = normalize_editor_operations(payload.get("operations"))
     selected_text = str(
         payload.get("selected_text")
@@ -255,17 +322,25 @@ def normalize_editor_chat(payload: Any) -> dict[str, Any]:
         or payload.get("original_text")
         or "",
     ).strip()
+    if not answer_markdown:
+        answer_markdown = str(payload.get("detailed_answer") or "").strip()
+    if not answer_markdown and suggestion["rationale"] and suggestion["rationale"] != "AI 没有提供额外说明。":
+        answer_markdown = suggestion["rationale"]
     if not content:
         if suggestion["rewritten_text"]:
             content = "已根据当前上下文给出一版可直接应用的改写。"
         else:
-            content = suggestion["rationale"] or "已完成这轮写作协作。"
+            content = "已完成这轮证据型写作协作。"
     return {
         "content": content,
+        "answer_markdown": answer_markdown,
         "selected_text": selected_text,
         "rewritten_text": suggestion["rewritten_text"],
         "operations": operations,
         "rationale": suggestion["rationale"],
+        "article_suggestions": normalize_structured_list(payload.get("article_suggestions")),
+        "evidence_sections": normalize_structured_list(payload.get("evidence_sections")),
+        "source_references": normalize_source_references(payload.get("source_references")),
         "process_summary": suggestion["process_summary"],
         "risks": suggestion["risks"],
         "citation_or_data_notes": suggestion["citation_or_data_notes"],
@@ -278,9 +353,13 @@ def parse_editor_chat_json(text: str) -> dict[str, Any]:
         text,
         fallback={
             "content": text.strip(),
+            "answer_markdown": text.strip(),
             "rewritten_text": "",
             "operations": [],
             "rationale": "AI 返回了非结构化内容，已作为会话回复展示。",
+            "article_suggestions": [],
+            "evidence_sections": [],
+            "source_references": [],
             "process_summary": [],
             "risks": [],
             "citation_or_data_notes": [],
@@ -360,12 +439,21 @@ def editor_chat_instructions(settings: dict[str, Any]) -> str:
         build_persona_block(settings)
         + (
         "You are a persistent academic writing collaborator working inside a manuscript editor chat. "
-        "The user may ask you to revise the currently selected passage, explain weaknesses, or iteratively refine an earlier draft. "
+        "The user may ask you to revise the currently selected passage, explain weaknesses, build an evidence plan, or iteratively refine an earlier draft. "
         "Sometimes no passage is selected; in that case, identify the single best concrete passage from the provided manuscript context that matches the user's request. "
         "Use only the provided selected passage, manuscript excerpt, manuscript section snapshots, project asset inventory, outline, local-source excerpts, recent editor turns, executed tool results, and project memory. "
         "Do not invent citations, data, or findings; flag uncertainty clearly. "
-        "Return JSON only with these fields: content, selected_text, rewritten_text, operations, rationale, process_summary, risks, citation_or_data_notes, confidence. "
-        "`content` must be a short chat-ready reply in 1-3 sentences. "
+        "Return JSON only with these fields: content, answer_markdown, selected_text, rewritten_text, operations, article_suggestions, evidence_sections, source_references, rationale, process_summary, risks, citation_or_data_notes, confidence. "
+        "`content` must be a short chat-ready one-sentence summary. "
+        "`answer_markdown` is the main user-facing response. Make it read like a sharp ChatGPT research-writing answer: clear Markdown headings, concise paragraphs, bullets, bold emphasis where useful, a stronger editorial voice, and a few tasteful structural emoji markers such as 🔑, 📊, 🌍, ⚠️, ✅ when they improve scanability. "
+        "Use numbered source citations like [1], [2] in `answer_markdown`, and place them inline directly after the evidence claim or detail they support. The UI will expand these IDs into clickable source-title links, so make sure every cited ID exists in `source_references` with a URL. Do not only put sources at the bottom. "
+        "For literature-review or evidence-planning requests, structure `answer_markdown` around: the core writing move, specific empirical evidence to collect, how each evidence type supports the argument, and minimum necessary evidence. Each evidence bullet should carry its relevant citation IDs in the same bullet or sentence. "
+        "A final compact source recap is allowed, but it must not be the only place where source IDs appear. "
+        "`article_suggestions` must be an array of concrete writing suggestions with fields like title, recommendation, and why. "
+        "`evidence_sections` must be an array of evidence categories with fields like title, evidence_needed, how_to_use, and source_ids. "
+        "`source_references` must be an array of objects with id, title, url, source_type, credibility, used_for, and snippet. Use executed external search results first by default. Use local_sources only when the user explicitly asks to use local/project/imported sources, or when a local source is the direct subject of the request. Every external source must include a usable URL; if only a bibliographic title is known, use a Google Scholar search URL rather than leaving url empty. "
+        "Prefer peer-reviewed articles, OpenAlex/DOI records, official policy pages, PDFs, and institutional reports for key empirical claims. If Wikipedia appears, mark it as background only and do not use it as the sole support for important statistics or empirical claims. "
+        "Strip tracking parameters such as utm_source from URLs. "
         "Set `rewritten_text` to a full replacement passage only when the user is asking for a concrete rewrite or revision; otherwise return an empty string. "
         "Whenever `rewritten_text` is non-empty, `selected_text` must also be non-empty and must be the exact original passage to replace from the manuscript context. "
         "Choose a sufficiently distinctive multi-sentence or full-paragraph `selected_text` whenever possible, so it can be matched safely in the manuscript. "
@@ -378,6 +466,7 @@ def editor_chat_instructions(settings: dict[str, Any]) -> str:
         "(3) `insert_figure` with `section_title`, `figure_relative_path`, `figure_title`, `figure_caption`, optional `figure_alt_text`, and optional `introduction`. "
         "Use `figure_relative_path` exactly as provided in the project asset inventory. "
         "Prefer `operations` for global edits, literature-review insertions, and figure placements. "
+        "Never put the explanatory `answer_markdown` text into `operations`; operations are the only content that can be automatically applied to the manuscript. "
         "Keep `operations` empty when the user only wants explanation or critique. "
         "`process_summary` must be an array of 2-4 short bullet strings that explain the visible revision process at a high level. "
         "Do not reveal hidden chain-of-thought or internal reasoning tokens."
@@ -390,16 +479,18 @@ def editor_tool_planner_instructions(settings: dict[str, Any]) -> str:
         build_persona_block(settings)
         + (
         "You are planning whether an academic manuscript editor should call internal tools before drafting an edit. "
-        "Use only the provided manuscript context, project asset inventory, local-source excerpts, and recent turns. "
+        "Use the provided manuscript context, project asset inventory, local-source excerpts, and recent turns to decide tool needs. "
         "Return JSON only with these fields: tool_actions, reason. "
         "`tool_actions` must be an array, possibly empty. "
         "Only request a tool when it is clearly necessary to satisfy the user's request better than direct editing alone. "
         "Allowed tool actions are: "
-        "(1) `import_literature` with `query` and optional `download_original`; use this when the user wants the editor to bring in a paper/article and use it in the manuscript. "
-        "(2) `create_data_figure` with `data_relative_path` and `prompt`; use this when the user wants a new figure generated from an existing project dataset. "
-        "(3) `create_brief` with `prompt`, optional `format`, and optional `scope_heading`; use this when the user wants a structured brief or summary artifact first. "
+        "(1) `search_literature` with `query`; by default use this when the user asks for evidence, citations, sources, empirical support, literature, policies, statistics, or external links. This action must not import or download files. "
+        "(2) `import_literature` with `query` and optional `download_original`; use this only when the user explicitly wants the editor to bring in a paper/article and use it in the manuscript. "
+        "(3) `create_data_figure` with `data_relative_path` and `prompt`; use this when the user wants a new figure generated from an existing project dataset. "
+        "(4) `create_brief` with `prompt`, optional `format`, and optional `scope_heading`; use this when the user wants a structured brief or summary artifact first. "
         "Never invent file paths. `data_relative_path` must exactly match one of the project data files in the provided asset inventory. "
-        "Keep `tool_actions` empty when direct rewriting or insertion is enough without tools. "
+        "Only prefer local sources over `search_literature` when the user explicitly says to use local/project/imported sources, a named uploaded source, or the current project source material. "
+        "Keep `tool_actions` empty only when direct rewriting or insertion is enough without evidence lookup. "
         "Prefer at most 2 tool actions in one response."
         )
     )

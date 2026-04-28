@@ -1,6 +1,8 @@
 import React from 'react';
 import { Check, X } from 'lucide-react';
 
+import { buildProjectFileUrl } from '../api';
+
 function tokenizeDiffText(text) {
   return String(text || '').match(
     /\s+|[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]|[A-Za-z0-9_]+|[^\sA-Za-z0-9_\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g,
@@ -103,10 +105,33 @@ function operationSummary(operation) {
 }
 
 function toolResultLabel(result) {
+  if (result.type === 'search_literature') return '外部资料检索';
   if (result.type === 'import_literature') return '文献导入';
   if (result.type === 'create_data_figure') return '图表生成';
   if (result.type === 'create_brief') return 'Brief 生成';
   return result.type || '工具执行';
+}
+
+function asHttpUrl(value) {
+  const text = String(value || '').trim();
+  return /^https?:\/\//i.test(text) ? text : '';
+}
+
+function sourceHref(source) {
+  const externalUrl = asHttpUrl(source.url || source.source_url);
+  if (externalUrl) return externalUrl;
+  const localName = String(source.text_file || source.filename || '').trim();
+  if (localName) return buildProjectFileUrl(`sources/${localName}`);
+  const title = String(source.title || '').trim();
+  return title ? `https://scholar.google.com/scholar?q=${encodeURIComponent(title)}` : '';
+}
+
+function credibilityLabel(value) {
+  if (value === 'high') return '高可信';
+  if (value === 'medium') return '中等可信';
+  if (value === 'background_only') return '背景资料';
+  if (value === 'project') return '项目资料';
+  return value || '待核对';
 }
 
 export function SuggestionPanel({ isBusy, onApply, onReject, suggestion, compact = false }) {
@@ -122,6 +147,7 @@ export function SuggestionPanel({ isBusy, onApply, onReject, suggestion, compact
   const diffSegments = buildHighlightedDiff(sourceText, rewrittenText);
   const hasHighlightedChanges = diffSegments.some((segment) => segment.changed && segment.value.trim());
   const toolResults = Array.isArray(suggestion.tool_results) ? suggestion.tool_results : [];
+  const sourceReferences = Array.isArray(suggestion.source_references) ? suggestion.source_references : [];
 
   return (
     <section className={`suggestion${compact ? ' compact' : ''}`}>
@@ -186,7 +212,7 @@ export function SuggestionPanel({ isBusy, onApply, onReject, suggestion, compact
                   <p className="suggestion-operation-meta">{result.error}</p>
                 ) : (
                   <p className="suggestion-operation-meta">
-                    {result.candidate_title || result.figure_relative_path || result.title || result.output_relative_path || ''}
+                    {result.candidate_title || result.figure_relative_path || result.title || result.output_relative_path || result.summary || ''}
                   </p>
                 )}
               </div>
@@ -237,7 +263,40 @@ export function SuggestionPanel({ isBusy, onApply, onReject, suggestion, compact
           </div>
         </details>
       )}
-      {suggestion.rationale && (
+      {sourceReferences.length > 0 && (
+        <div className="suggestion-sources">
+          <h3>🔎 Sources</h3>
+          <div className="suggestion-source-list">
+            {sourceReferences.map((source, index) => {
+              const href = sourceHref(source);
+              const sourceId = String(source.id || index + 1).replace(/^\[|\]$/g, '');
+              const isFallbackSearch = href.includes('scholar.google.com') && !asHttpUrl(source.url || source.source_url);
+              return (
+                <article className="suggestion-source-card" key={`${sourceId}-${source.url || source.title || index}`}>
+                  <div className="suggestion-source-topline">
+                    <span className="suggestion-source-id">[{sourceId}]</span>
+                    {href ? (
+                      <a href={href} rel="noreferrer" target="_blank">
+                        {source.title || source.filename || `Source ${sourceId}`}
+                      </a>
+                    ) : (
+                      <strong>{source.title || source.filename || `Source ${sourceId}`}</strong>
+                    )}
+                  </div>
+                  <div className="suggestion-source-tags">
+                    <span>{source.source_type || 'source'}</span>
+                    <span>{credibilityLabel(source.credibility)}</span>
+                    {isFallbackSearch && <span>Scholar search</span>}
+                  </div>
+                  {source.used_for && <p>{source.used_for}</p>}
+                  {source.snippet && <blockquote>{source.snippet}</blockquote>}
+                </article>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      {suggestion.rationale && !suggestion.answer_markdown && (
         <>
           <h3>理由</h3>
           <p>{suggestion.rationale}</p>

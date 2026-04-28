@@ -34,7 +34,7 @@ DEFAULT_AI_INSTRUCTION = (
 
 DEFAULT_SETTINGS = {
     "provider": "openai",
-    "model": "gpt-5.5",
+    "model": "gpt-5.4-mini",
     "reasoning": "medium",
     "instruction": DEFAULT_AI_INSTRUCTION,
     "reference_doc": "templates/reference.docx",
@@ -44,10 +44,10 @@ DEFAULT_SETTINGS = {
 
 DEFAULT_PROVIDER_MODELS = {
     "openai": [
-        {"id": "gpt-5.5", "label": "gpt-5.5", "description": "Balanced default."},
-        {"id": "gpt-5.5-pro", "label": "gpt-5.5-pro", "description": "Higher capability, higher cost."},
+        {"id": "gpt-5.4-mini", "label": "gpt-5.4-mini", "description": "Balanced default."},
         {"id": "gpt-5.4", "label": "gpt-5.4", "description": "Strong general model."},
-        {"id": "gpt-5.4-mini", "label": "gpt-5.4-mini", "description": "Lower cost and faster."},
+        {"id": "gpt-5.5", "label": "gpt-5.5", "description": "Higher capability, higher cost."},
+        {"id": "gpt-5.5-pro", "label": "gpt-5.5-pro", "description": "Higher capability, higher cost."},
         {"id": "gpt-5.2", "label": "gpt-5.2", "description": "Stable fallback."},
     ],
     "deepseek": [

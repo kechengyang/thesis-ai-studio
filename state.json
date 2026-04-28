@@ -1,8 +1,9 @@
 {
-  "workspace_path": "/private/tmp/tas-visual-regression",
-  "projects_root": "/private/tmp/tas-visual-regression",
-  "active_project": "tas-visual-regression",
+  "workspace_path": "/Users/kecheng_yang/kechengyang/yokase/yokase/personal/higher-education",
+  "projects_root": "/Users/kecheng_yang/kechengyang/yokase/yokase/personal/higher-education",
+  "active_project": "higher-education",
   "active_manuscripts": {
-    "/private/tmp/tas-visual-regression": "paper.qmd"
+    "/private/tmp/tas-visual-regression": "paper.qmd",
+    "/Users/kecheng_yang/kechengyang/yokase/yokase/personal/higher-education": "Paper_Outline_Higher_Education.qmd"
   }
 }
