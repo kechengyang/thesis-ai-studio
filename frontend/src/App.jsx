@@ -13,6 +13,8 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Redo2,
+  RotateCcw,
   Save,
   Settings,
   Sparkles,
@@ -145,18 +147,24 @@ function hasEditorToolResults(result) {
   return Array.isArray(result?.tool_results) && result.tool_results.length > 0;
 }
 
+const EDITOR_HISTORY_LIMIT = 80;
+const EDITOR_HISTORY_GROUP_MS = 700;
+
 export default function App() {
   const editorRef = useRef(null);
   const previewRef = useRef(null);
   const sourceImportRef = useRef(null);
   const fileMenuRef = useRef(null);
   const manuscriptResizeRef = useRef({ active: false, startX: 0, startWidth: 0 });
+  const editorHistoryRef = useRef({ past: [], future: [] });
+  const editorTypingRef = useRef({ active: false, timeoutId: 0 });
   const [project, setProject] = useState(null);
   const [content, setContent] = useState('');
   const [savedContent, setSavedContent] = useState('');
   const [selectedText, setSelectedText] = useState('');
   const [editorNeedsFreshSelection, setEditorNeedsFreshSelection] = useState(false);
   const [editorMessages, setEditorMessages] = useState([]);
+  const [editorHistoryState, setEditorHistoryState] = useState({ canUndo: false, canRedo: false });
   const [settings, setSettings] = useState({ provider: 'openai', model: 'gpt-5.5', reasoning: 'medium', instruction: '' });
   const [openaiApiKey, setOpenaiApiKey] = useState('');
   const [deepseekApiKey, setDeepseekApiKey] = useState('');
@@ -186,12 +194,14 @@ export default function App() {
     setDeepseekBaseUrl(projectData.settings.deepseek_base_url || '');
     if (!hasConfiguredWorkspace(projectData)) {
       resetWorkspaceTransientState();
+      resetEditorHistory();
       setContent('');
       setSavedContent('');
       setActiveOutlineId('');
       return;
     }
     const documentData = await studioApi.getDocument();
+    resetEditorHistory();
     setContent(documentData.content);
     setSavedContent(documentData.content);
     const nextOutline = splitSections(documentData.content);
@@ -270,6 +280,10 @@ export default function App() {
     window.localStorage.setItem('tas.manuscriptAiWidth', String(manuscriptAiWidth));
   }, [manuscriptAiWidth]);
 
+  useEffect(() => () => {
+    clearEditorTypingBatch();
+  }, []);
+
   async function refreshMemory() {
     if (!hasConfiguredWorkspace(project)) return;
     const memory = await studioApi.getMemory();
@@ -297,6 +311,142 @@ export default function App() {
     setEditorNeedsFreshSelection(false);
     setEditorMessages([]);
     setPreviewFile(null);
+  }
+
+  function syncEditorHistoryState() {
+    const history = editorHistoryRef.current;
+    setEditorHistoryState({
+      canUndo: history.past.length > 0,
+      canRedo: history.future.length > 0,
+    });
+  }
+
+  function clearEditorTypingBatch() {
+    const typing = editorTypingRef.current;
+    if (typing.timeoutId) {
+      window.clearTimeout(typing.timeoutId);
+    }
+    typing.active = false;
+    typing.timeoutId = 0;
+  }
+
+  function resetEditorHistory() {
+    clearEditorTypingBatch();
+    editorHistoryRef.current = { past: [], future: [] };
+    syncEditorHistoryState();
+  }
+
+  function getEditorSelectionRange() {
+    const editor = editorRef.current;
+    if (!editor) return { start: 0, end: 0 };
+    return {
+      start: editor.selectionStart || 0,
+      end: editor.selectionEnd || 0,
+    };
+  }
+
+  function restoreEditorSelection(selection) {
+    if (!selection || showPreview) return;
+    window.requestAnimationFrame(() => {
+      const editor = editorRef.current;
+      if (!editor) return;
+      const start = Math.max(0, Math.min(selection.start ?? 0, editor.value.length));
+      const end = Math.max(0, Math.min(selection.end ?? start, editor.value.length));
+      editor.focus();
+      editor.setSelectionRange(start, end);
+    });
+  }
+
+  function pushEditorHistorySnapshot(snapshot) {
+    const history = editorHistoryRef.current;
+    const last = history.past[history.past.length - 1];
+    if (last?.content === snapshot.content) {
+      return;
+    }
+    history.past.push(snapshot);
+    if (history.past.length > EDITOR_HISTORY_LIMIT) {
+      history.past.shift();
+    }
+    history.future = [];
+    syncEditorHistoryState();
+  }
+
+  function applyEditorContent(nextContent, options = {}) {
+    const {
+      markSaved = false,
+      recordHistory = false,
+      selection = null,
+    } = options;
+    clearEditorTypingBatch();
+    if (recordHistory && nextContent !== content) {
+      pushEditorHistorySnapshot({ content, selection: getEditorSelectionRange() });
+    }
+    setContent(nextContent);
+    if (markSaved) {
+      setSavedContent(nextContent);
+    }
+    restoreEditorSelection(selection);
+    if (!recordHistory) {
+      syncEditorHistoryState();
+    }
+  }
+
+  function scheduleEditorTypingBoundary() {
+    const typing = editorTypingRef.current;
+    if (typing.timeoutId) {
+      window.clearTimeout(typing.timeoutId);
+    }
+    typing.active = true;
+    typing.timeoutId = window.setTimeout(() => {
+      typing.active = false;
+      typing.timeoutId = 0;
+    }, EDITOR_HISTORY_GROUP_MS);
+  }
+
+  function handleEditorChange(event) {
+    const nextValue = event.target.value;
+    if (nextValue === content) return;
+    if (!editorTypingRef.current.active) {
+      pushEditorHistorySnapshot({ content, selection: getEditorSelectionRange() });
+    }
+    scheduleEditorTypingBoundary();
+    setContent(nextValue);
+  }
+
+  function undoEditorChange() {
+    clearEditorTypingBatch();
+    const history = editorHistoryRef.current;
+    const previous = history.past.pop();
+    if (!previous) {
+      syncEditorHistoryState();
+      return false;
+    }
+    history.future.push({ content, selection: getEditorSelectionRange() });
+    if (history.future.length > EDITOR_HISTORY_LIMIT) {
+      history.future.shift();
+    }
+    setContent(previous.content);
+    restoreEditorSelection(previous.selection);
+    syncEditorHistoryState();
+    return true;
+  }
+
+  function redoEditorChange() {
+    clearEditorTypingBatch();
+    const history = editorHistoryRef.current;
+    const next = history.future.pop();
+    if (!next) {
+      syncEditorHistoryState();
+      return false;
+    }
+    history.past.push({ content, selection: getEditorSelectionRange() });
+    if (history.past.length > EDITOR_HISTORY_LIMIT) {
+      history.past.shift();
+    }
+    setContent(next.content);
+    restoreEditorSelection(next.selection);
+    syncEditorHistoryState();
+    return true;
   }
 
   function readEditorSelection() {
@@ -330,6 +480,22 @@ export default function App() {
       editor.setSelectionRange(safePosition, safePosition);
       editor.scrollTop = Math.max(0, (lineNumber - 2) * lineHeight);
     });
+  }
+
+  function handleEditorKeyDown(event) {
+    if (event.defaultPrevented || event.altKey) return;
+    const key = String(event.key || '').toLowerCase();
+    const primaryModifier = event.metaKey || event.ctrlKey;
+    if (!primaryModifier) return;
+
+    const wantsUndo = key === 'z' && !event.shiftKey;
+    const wantsRedo = (key === 'z' && event.shiftKey) || (key === 'y' && event.ctrlKey && !event.metaKey);
+    if (!wantsUndo && !wantsRedo) return;
+
+    const handled = wantsRedo ? redoEditorChange() : undoEditorChange();
+    if (handled) {
+      event.preventDefault();
+    }
   }
 
   function jumpToPreviewHeading(anchorId) {
@@ -665,12 +831,11 @@ export default function App() {
     setBusy('apply');
     try {
       const data = await studioApi.applySuggestion(result.selected_text, result.rewritten_text, result.suggestion_id, operations);
-      setContent(data.content);
-      setSavedContent(data.content);
+      applyEditorContent(data.content, { markSaved: true, recordHistory: true });
       setSelectedText('');
       setEditorNeedsFreshSelection(true);
       await refreshMemory();
-      setMessage(operations.length > 0 ? `已将 ${operations.length} 个编辑动作应用到正文。` : '修改已应用到正文。');
+      setMessage(operations.length > 0 ? `已将 ${operations.length} 个编辑动作应用到正文。可在主编辑框按 Cmd+Z 撤回。` : '修改已应用到正文。可在主编辑框按 Cmd+Z 撤回。');
     } catch (error) {
       setMessage(error.message);
     } finally {
@@ -1113,6 +1278,22 @@ export default function App() {
                   </p>
                 </div>
                 <div className="editor-actions">
+                  <button
+                    disabled={isBusy || !editorHistoryState.canUndo}
+                    onClick={undoEditorChange}
+                    title="撤回上一笔编辑（Cmd+Z）"
+                    type="button"
+                  >
+                    <RotateCcw size={18} />撤回
+                  </button>
+                  <button
+                    disabled={isBusy || !editorHistoryState.canRedo}
+                    onClick={redoEditorChange}
+                    title="重做（Shift+Cmd+Z）"
+                    type="button"
+                  >
+                    <Redo2 size={18} />重做
+                  </button>
                   <button onClick={() => setShowPreview((current) => !current)} title="预览 QMD">
                     <Eye size={18} />{showPreview ? '继续编辑' : '预览'}
                   </button>
@@ -1132,7 +1313,8 @@ export default function App() {
                 <textarea
                   ref={editorRef}
                   value={content}
-                  onChange={(event) => setContent(event.target.value)}
+                  onChange={handleEditorChange}
+                  onKeyDown={handleEditorKeyDown}
                   onSelect={captureSelection}
                   spellCheck={true}
                 />

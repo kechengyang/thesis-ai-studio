@@ -76,7 +76,10 @@ class WorkspaceRootUpdate(BaseModel):
 
 
 class LiteratureAnalyzeRequest(BaseModel):
-    query: str
+    query: str = ""
+    source_filename: Optional[str] = None
+    text_file: Optional[str] = None
+    cache_id: Optional[str] = None
 
 
 class LiteratureImportRequest(BaseModel):

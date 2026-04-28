@@ -1225,6 +1225,31 @@ def read_source_entry(project: Path, filename: str = "", text_file: str = "") ->
     return None
 
 
+def literature_candidate_from_source_entry(project: Path, source_entry: dict[str, Any] | None) -> dict[str, Any]:
+    if not source_entry:
+        return {}
+    filename = str(source_entry.get("filename", "") or source_entry.get("text_file", "") or "").strip()
+    text_file = str(source_entry.get("text_file", "")).strip()
+    title = re.sub(r"[_-]+", " ", Path(filename).stem).strip() or filename or "Imported source"
+    excerpt_text = ""
+    if text_file:
+        text_path = project / "sources" / text_file
+        if text_path.exists():
+            excerpt_text = excerpt(text_path.read_text(encoding="utf-8", errors="ignore"), limit=6000)
+    return {
+        "title": title,
+        "authors": [],
+        "year": "",
+        "venue": "Project source",
+        "abstract": "",
+        "source_url": str(source_entry.get("source_url", "") or "").strip(),
+        "download_url": "",
+        "doi": "",
+        "openalex_id": "",
+        "excerpt": excerpt_text,
+    }
+
+
 def focused_source_hits(project: Path, source_entry: dict[str, Any] | None, query: str, limit: int = 5) -> list[dict[str, str]]:
     if not source_entry:
         return []
@@ -1276,6 +1301,10 @@ def build_literature_chat_context(req: ChatRequest, project: Path) -> dict[str, 
             pass
 
     source_entry = read_source_entry(project, filename=source_filename, text_file=text_file)
+    default_candidate = literature_candidate_from_source_entry(project, source_entry)
+    for key, value in default_candidate.items():
+        if not candidate.get(key):
+            candidate[key] = value
     source_hits = focused_source_hits(project, source_entry, req.message or candidate.get("title", ""), limit=4)
     if not source_hits and (req.message or candidate.get("title")):
         source_hits = search_sources(f"{candidate.get('title', '')}\n{req.message}".strip(), limit=4)
@@ -2146,11 +2175,65 @@ def analyze_literature(req: LiteratureAnalyzeRequest) -> dict[str, Any]:
     ensure_workspace()
     provider, settings = configured_provider()
     project = workspace_path()
-    bundle = search_literature_candidates(req.query)
-    candidate = bundle["candidate"]
-    candidate.setdefault("excerpt", "")
     outline = outline_from_document(paper_path().read_text(encoding="utf-8"))
-    prompt = build_literature_prompt(req.query, candidate, outline)
+    query = str(req.query or "").strip()
+    cache_id = str(req.cache_id or "").strip()
+    source_filename = str(req.source_filename or "").strip()
+    text_file = str(req.text_file or "").strip()
+    source_entry = read_source_entry(project, filename=source_filename, text_file=text_file)
+    source_focus = None
+    cached_analysis: dict[str, Any] = {}
+
+    if cache_id or source_entry:
+        bundle = {
+            "candidate": {},
+            "search_results": [],
+            "scholar_search_url": "",
+            "query_kind": "focus",
+        }
+        candidate = {}
+        if cache_id:
+            try:
+                cached = load_cached_literature(cache_id)
+                candidate = dict(cached.get("candidate") or {})
+                cached_analysis = dict(cached.get("analysis") or {})
+            except HTTPException:
+                pass
+        default_candidate = literature_candidate_from_source_entry(project, source_entry)
+        for key, value in default_candidate.items():
+            if not candidate.get(key):
+                candidate[key] = value
+        if not candidate.get("title") and not query:
+            raise HTTPException(status_code=400, detail="请选择项目资料，或输入论文标题、DOI、URL。")
+        source_hits = focused_source_hits(project, source_entry, query or candidate.get("title", ""), limit=4)
+        source_focus = (
+            {
+                "filename": source_entry.get("filename", ""),
+                "text_file": source_entry.get("text_file", ""),
+                "title": candidate.get("title", "") or source_entry.get("filename", ""),
+                "downloaded_original": bool(source_entry.get("downloaded_original")),
+            }
+            if source_entry
+            else None
+        )
+        if candidate.get("title"):
+            bundle["scholar_search_url"] = build_google_scholar_search_url(candidate.get("title", ""))
+        prompt = build_literature_prompt(
+            query or candidate.get("title", ""),
+            candidate,
+            outline,
+            imported_source_excerpts=source_hits,
+            source_focus=source_focus,
+            query_kind="focus",
+        )
+    else:
+        if not query:
+            raise HTTPException(status_code=400, detail="请输入论文标题、DOI、URL，或选择项目资料。")
+        bundle = search_literature_candidates(query)
+        candidate = bundle["candidate"]
+        candidate.setdefault("excerpt", "")
+        prompt = build_literature_prompt(query, candidate, outline, query_kind=bundle.get("query_kind", "query"))
+
     try:
         result = provider.analyze_literature(settings, prompt)
     except Exception as exc:
@@ -2160,9 +2243,10 @@ def analyze_literature(req: LiteratureAnalyzeRequest) -> dict[str, Any]:
     analysis["authors"] = analysis.get("authors") or candidate.get("authors", [])
     analysis["year"] = analysis.get("year") or candidate.get("year", "")
     analysis["venue"] = analysis.get("venue") or candidate.get("venue", "")
+    analysis["literature_review"] = analysis.get("literature_review") or cached_analysis.get("literature_review", "")
     output_relative_path = save_literature_review_output(project, candidate, analysis)
     cached_payload = {
-        "query": req.query,
+        "query": query or candidate.get("title", ""),
         "candidate": candidate,
         "analysis": analysis,
         "raw": result.get("raw", ""),
@@ -2176,6 +2260,7 @@ def analyze_literature(req: LiteratureAnalyzeRequest) -> dict[str, Any]:
         "search_results": bundle.get("search_results", []),
         "scholar_search_url": bundle.get("scholar_search_url", ""),
         "query_kind": bundle.get("query_kind", "query"),
+        "source_focus": source_focus,
         "analysis": analysis,
         "download_available": bool(candidate.get("download_url")),
         "output_relative_path": output_relative_path,

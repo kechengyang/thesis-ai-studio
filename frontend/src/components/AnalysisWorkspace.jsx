@@ -32,6 +32,28 @@ function ResultLink({ label, url }) {
   );
 }
 
+function literatureSourceTitle(source) {
+  return String(source?.filename || source?.text_file || 'Imported source').trim() || 'Imported source';
+}
+
+function literatureSourceOptionLabel(source) {
+  return `${literatureSourceTitle(source)} · ${source?.downloaded_original ? '原文' : '文本摘要'}`;
+}
+
+function buildLiteratureFocus(source, overrides = {}) {
+  return {
+    cache_id: overrides.cache_id || '',
+    filename: source?.filename || '',
+    text_file: source?.text_file || '',
+    title: overrides.title || literatureSourceTitle(source),
+    downloaded_original: Boolean(source?.downloaded_original),
+  };
+}
+
+function defaultLiteratureSourcePrompt() {
+  return '请结合当前稿件结构评估这篇文献，总结核心观点，说明相关性，给出 citation uses，并直接起草一段 literature review。';
+}
+
 // ── Result renderers ──────────────────────────────────────
 
 function MindmapResult({ msg }) {
@@ -408,6 +430,10 @@ export function AnalysisWorkspace({
     () => filesByCategory(project, 'Figures').filter((item) => ['png', 'jpg', 'jpeg', 'svg', 'webp'].includes(item.extension)),
     [project],
   );
+  const projectSources = useMemo(
+    () => (project?.sources || []).filter((item) => item?.text_file),
+    [project],
+  );
   const outlineTitles = useMemo(
     () => (outline || []).map((item) => item.title).filter(Boolean),
     [outline],
@@ -419,6 +445,7 @@ export function AnalysisWorkspace({
   const [briefFormat, setBriefFormat] = useState('ppt');
   const [briefScopeHeading, setBriefScopeHeading] = useState('');
   const [literatureFocus, setLiteratureFocus] = useState(null);
+  const [selectedLiteratureSource, setSelectedLiteratureSource] = useState('');
 
   const [toolInput, setToolInput] = useState({ literature: '', data: '', mindmap: '', brief: '' });
 
@@ -461,6 +488,15 @@ export function AnalysisWorkspace({
   }, [chatHistories.literature, literatureFocus]);
 
   useEffect(() => {
+    if (literatureFocus?.text_file && projectSources.some((item) => item.text_file === literatureFocus.text_file)) {
+      setSelectedLiteratureSource(literatureFocus.text_file);
+      return;
+    }
+    if (selectedLiteratureSource && projectSources.some((item) => item.text_file === selectedLiteratureSource)) return;
+    setSelectedLiteratureSource(projectSources[0]?.text_file || '');
+  }, [projectSources, selectedLiteratureSource, literatureFocus?.text_file]);
+
+  useEffect(() => {
     if (!selectedDataFile && dataFiles[0]) {
       setSelectedDataFile(dataFiles[0].relative_path);
       return;
@@ -489,20 +525,25 @@ export function AnalysisWorkspace({
     event.preventDefault();
   }
 
-  async function handleSend(tool) {
-    const message = toolInput[tool].trim();
-    if (!message || chatBusy) return;
+  function buildToolContext(tool, overrideLiteratureFocus = null) {
+    if (tool === 'data') return { relative_path: selectedDataFile };
+    if (tool === 'brief') return { format: briefFormat, scope_heading: briefScopeHeading };
+    if (tool === 'literature' && overrideLiteratureFocus?.text_file) return { ...overrideLiteratureFocus };
+    if (tool === 'literature' && literatureFocus?.text_file) return { ...literatureFocus };
+    return {};
+  }
 
-    const context = tool === 'data'
-      ? { relative_path: selectedDataFile }
-      : tool === 'brief'
-        ? { format: briefFormat, scope_heading: briefScopeHeading }
-        : tool === 'literature' && literatureFocus?.text_file
-          ? { ...literatureFocus }
-          : {};
+  async function handleSend(tool, options = {}) {
+    const previousInput = toolInput[tool];
+    const message = String(options.message ?? previousInput).trim();
+    if (!message || chatBusy) return;
+    const context = options.context || buildToolContext(tool);
+    const shouldClearInput = options.clearInput !== false;
 
     setChatBusy(tool);
-    setToolInput((prev) => ({ ...prev, [tool]: '' }));
+    if (shouldClearInput) {
+      setToolInput((prev) => ({ ...prev, [tool]: '' }));
+    }
 
     const optimisticUser = {
       id: `optimistic-${Date.now()}`,
@@ -530,7 +571,9 @@ export function AnalysisWorkspace({
         ...prev,
         [tool]: prev[tool].filter((m) => m.id !== optimisticUser.id),
       }));
-      setToolInput((prev) => ({ ...prev, [tool]: message }));
+      if (shouldClearInput) {
+        setToolInput((prev) => ({ ...prev, [tool]: previousInput || message }));
+      }
       onSetMessage(error.message);
     } finally {
       setChatBusy('');
@@ -555,10 +598,51 @@ export function AnalysisWorkspace({
     }
   }
 
+  const selectedSourceEntry = useMemo(
+    () => projectSources.find((item) => item.text_file === selectedLiteratureSource) || null,
+    [projectSources, selectedLiteratureSource],
+  );
+
+  function activateLiteratureSource(source, options = {}) {
+    if (!source?.text_file) {
+      onSetMessage('请先选择一个项目资料。');
+      return;
+    }
+    const nextFocus = buildLiteratureFocus(source);
+    setLiteratureFocus(nextFocus);
+    setSelectedLiteratureSource(nextFocus.text_file);
+    setActiveTool('literature');
+    if (options.announce !== false) {
+      onSetMessage(`已将「${nextFocus.title}」设为当前文献焦点。`);
+    }
+  }
+
+  function handleUseSelectedLiteratureSource() {
+    if (!selectedSourceEntry) {
+      onSetMessage('请先选择一个项目资料。');
+      return;
+    }
+    activateLiteratureSource(selectedSourceEntry);
+  }
+
+  async function handleAnalyzeSelectedLiteratureSource() {
+    if (!selectedSourceEntry) {
+      onSetMessage('请先选择一个项目资料。');
+      return;
+    }
+    const nextFocus = buildLiteratureFocus(selectedSourceEntry);
+    activateLiteratureSource(selectedSourceEntry, { announce: false });
+    await handleSend('literature', {
+      message: defaultLiteratureSourcePrompt(),
+      context: nextFocus,
+      clearInput: false,
+    });
+  }
+
   const activeManuscriptName = project?.active_manuscript?.split('/').pop() || 'No manuscript';
 
   const toolOptions = [
-    { id: 'literature', label: 'Literature', hint: '标题 / DOI / URL + Scholar fallback', icon: BookText },
+    { id: 'literature', label: 'Literature', hint: '项目资料 / 标题 / DOI / URL', icon: BookText },
     { id: 'data', label: 'Data Analysis', hint: '图表生成 + 文中插入', icon: Database },
     { id: 'mindmap', label: 'Mindmap', hint: 'Mermaid 理论图谱', icon: Sparkles },
     { id: 'brief', label: 'PPT / Poster Brief', hint: '展示摘要 + key messages', icon: FileText },
@@ -595,8 +679,8 @@ export function AnalysisWorkspace({
   const toolConfig = {
     literature: {
       placeholder: literatureFocus?.text_file
-        ? `当前正围绕「${literatureFocus.title || literatureFocus.filename}」讨论。可以继续追问文章内容，或直接让 AI 生成 literature review。`
-        : '优先输入论文标题、DOI 或 URL；如果还没有具体条目，也可以先输入主题，我会给你候选结果和 Scholar 搜索入口。',
+        ? `当前正围绕「${literatureFocus.title || literatureFocus.filename}」讨论。可以继续追问文章内容，或清除焦点后改用标题、DOI、URL、主题词。`
+        : '可以先从项目资料里选择 source，也可以直接输入论文标题、DOI、URL 或主题词。',
       label: '文献查找 / 分析',
     },
     data: {
@@ -632,6 +716,34 @@ export function AnalysisWorkspace({
           )}
           {outlineTitles.length > outlinePreview.length && (
             <p>+ {outlineTitles.length - outlinePreview.length} more sections</p>
+          )}
+        </section>
+
+        <section className="analysis-sidebar-card">
+          <div className="panel-heading compact">
+            <BookText size={16} />
+            <span>Sources</span>
+          </div>
+          {projectSources.length > 0 ? (
+            <div className="analysis-file-picker">
+              {projectSources.map((source) => {
+                const isActive = literatureFocus?.text_file === source.text_file;
+                return (
+                  <button
+                    className={`analysis-file-button ${isActive ? 'active' : ''}`}
+                    disabled={anyChatBusy}
+                    key={source.text_file}
+                    onClick={() => activateLiteratureSource(source)}
+                    type="button"
+                  >
+                    <strong>{literatureSourceTitle(source)}</strong>
+                    <span>{source.downloaded_original ? 'Original imported' : 'Extracted text available'}</span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="empty-line">No imported sources yet.</p>
           )}
         </section>
 
@@ -736,6 +848,38 @@ export function AnalysisWorkspace({
                       </button>
                     )}
                   </div>
+
+                  {tool.id === 'literature' && (
+                    <div className="analysis-subcard">
+                      <span>Start From Project Source</span>
+                      {projectSources.length > 0 ? (
+                        <>
+                          <div className="tool-form-controls">
+                            <select
+                              disabled={anyChatBusy}
+                              onChange={(e) => setSelectedLiteratureSource(e.target.value)}
+                              value={selectedLiteratureSource}
+                            >
+                              {projectSources.map((source) => (
+                                <option key={source.text_file} value={source.text_file}>
+                                  {literatureSourceOptionLabel(source)}
+                                </option>
+                              ))}
+                            </select>
+                            <button disabled={anyChatBusy || !selectedSourceEntry} onClick={handleUseSelectedLiteratureSource} type="button">
+                              设为焦点
+                            </button>
+                            <button className="primary" disabled={anyChatBusy || !selectedSourceEntry} onClick={handleAnalyzeSelectedLiteratureSource} type="button">
+                              快速分析
+                            </button>
+                          </div>
+                          <p className="analysis-inline-note">也可以不选项目资料，直接在下方输入论文标题、DOI、URL 或检索提示。</p>
+                        </>
+                      ) : (
+                        <p className="empty-line">先导入 PDF / DOCX 等资料，或直接在下方输入论文标题、DOI、URL。</p>
+                      )}
+                    </div>
+                  )}
 
                   {tool.id === 'literature' && literatureFocus?.text_file && (
                     <div className="analysis-subcard">

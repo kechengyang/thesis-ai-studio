@@ -592,7 +592,9 @@ h1 {
 
 .editor-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
+  justify-content: flex-end;
 }
 
 .manuscript-switcher-row {

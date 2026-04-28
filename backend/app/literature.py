@@ -270,12 +270,24 @@ def resolve_literature_candidate(query: str) -> dict[str, Any]:
     return search_literature_candidates(query, limit=5)["candidate"]
 
 
-def build_literature_prompt(query: str, candidate: dict[str, Any], outline: list[dict[str, Any]]) -> str:
+def build_literature_prompt(
+    query: str,
+    candidate: dict[str, Any],
+    outline: list[dict[str, Any]],
+    imported_source_excerpts: list[dict[str, str]] | None = None,
+    source_focus: dict[str, Any] | None = None,
+    query_kind: str = "query",
+) -> str:
     payload = {
         "user_query": query,
+        "query_kind": query_kind,
         "candidate_source": candidate,
         "paper_outline": outline,
     }
+    if imported_source_excerpts:
+        payload["imported_source_excerpts"] = imported_source_excerpts
+    if source_focus:
+        payload["source_focus"] = source_focus
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 

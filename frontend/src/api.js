@@ -146,8 +146,9 @@ export const studioApi = {
   createBrief(payload) {
     return request('/analysis/brief', jsonOptions('POST', payload));
   },
-  analyzeLiterature(query) {
-    return request('/literature/analyze', jsonOptions('POST', { query }));
+  analyzeLiterature(payload) {
+    const body = typeof payload === 'string' ? { query: payload } : (payload || {});
+    return request('/literature/analyze', jsonOptions('POST', body));
   },
   importLiterature(cacheId, downloadOriginal) {
     return request('/literature/import', jsonOptions('POST', {
